@@ -37,7 +37,7 @@ use openlogi_hook::Hook;
 use tarpc::context::Context;
 use tarpc::server::{BaseChannel, Channel as _};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Shared handle to the agent's state, cloned per connection (and per request).
 #[derive(Clone)]
@@ -449,7 +449,10 @@ async fn play_within_budget(
         )
         .await
         {
-            Ok(Ok(())) => return true,
+            Ok(Ok(())) => {
+                debug!(interaction, attempt, ?waveform, "ring haptic played");
+                return true;
+            }
             Ok(Err(error)) => {
                 let superseded = rx.has_changed().unwrap_or(true);
                 if attempt == 3 || superseded {
@@ -462,6 +465,10 @@ async fn play_within_budget(
             Err(_elapsed) => {}
         }
     }
+    warn!(
+        interaction,
+        "ring haptic gave up — last attempt ran out of time"
+    );
     false
 }
 
@@ -578,7 +585,14 @@ impl RingHapticPlayer {
         let Some(route) = route else {
             return;
         };
-        let _ = self.tx.send(Some((route, waveform, interaction)));
+        if self.tx.send(Some((route, waveform, interaction))).is_err() {
+            // The single worker is gone (it only exits by panicking), so every
+            // later buzz would vanish without a trace until the agent restarts.
+            error!(
+                interaction,
+                "ring haptic worker is not running — buzz dropped"
+            );
+        }
     }
 }
 
