@@ -191,10 +191,8 @@ struct GestureCapture {
 
 impl GestureCapture {
     fn new(armed: ArmedControls) -> Self {
-        Self {
-            armed,
-            accum: Arc::default(),
-        }
+        let accum = Arc::new(Mutex::new(armed.capture_accum()));
+        Self { armed, accum }
     }
 }
 
@@ -263,7 +261,8 @@ impl ArmedCapture for GestureCapture {
     }
 
     fn reset_input_state(&self) {
-        *self.accum.lock().unwrap_or_else(PoisonError::into_inner) = CaptureAccum::default();
+        // A reconnect discards the in-flight hold but keeps the device policy.
+        *self.accum.lock().unwrap_or_else(PoisonError::into_inner) = self.armed.capture_accum();
     }
 
     async fn rearm(&self) {
