@@ -98,6 +98,51 @@ pub(crate) fn hidpp_side_gesture_maps_for(
         .collect()
 }
 
+/// Whether `bindings` gives the thumb wheel anything but its firmware default.
+fn thumbwheel_nondefault(bindings: &BTreeMap<ButtonId, Binding>) -> bool {
+    [
+        ButtonId::Thumbwheel,
+        ButtonId::ThumbwheelScrollUp,
+        ButtonId::ThumbwheelScrollDown,
+    ]
+    .iter()
+    .any(|button| {
+        bindings
+            .get(button)
+            .is_some_and(|binding| binding.click_action() != default_binding(*button))
+    })
+}
+
+/// The base bindings followed by every app profile's effective bindings: the
+/// complete set a front app could ever resolve to. Capture decisions read this
+/// so they come out identical whichever app is in front.
+fn all_profile_bindings(config: &Config, config_key: &str) -> Vec<BTreeMap<ButtonId, Binding>> {
+    std::iter::once(None)
+        .chain(config.app_profiles(config_key).map(Some))
+        .map(|app| button_bindings_for(config, Some(config_key), app))
+        .collect()
+}
+
+/// Whether `button`'s binding needs a plain HID++ divert to be deliverable.
+fn wants_plain_divert(bindings: &BTreeMap<ButtonId, Binding>, button: ButtonId) -> bool {
+    bindings.get(&button).is_some_and(|binding| {
+        if matches!(binding, Binding::LongPress(_)) {
+            return true;
+        }
+        let action = binding.click_action();
+        // Gesture sources have no host-visible firmware action, so any single
+        // binding needs the divert. `None` leaves them native.
+        if GESTURE_SOURCE_BUTTONS
+            .iter()
+            .any(|(_, source)| *source == button)
+        {
+            action != Action::None
+        } else {
+            action != default_binding(button)
+        }
+    })
+}
+
 /// Build one device's plan from the config (per-app effective for `app`).
 #[must_use]
 pub fn plan_for_device(
@@ -120,6 +165,28 @@ pub fn plan_for_device(
     // gesture at once, each armed with its own raw-XY divert (the capture
     // target below derives the CIDs to divert from this map's keys).
     let gesture_bindings = hidpp_gesture_maps_for(config, Some(config_key), app);
+    // What the DEVICE is asked to divert must not depend on the front app, or
+    // every app switch re-arms the whole session over HID++. A per-app profile
+    // can only replace a button with a single action — never add gesture mode —
+    // so the base map is the superset: a source gesturing anywhere stays on
+    // its raw-XY divert everywhere, and in an app whose profile single-binds
+    // it, dispatch (which does follow the front app) fires the single action
+    // on press and ignores the gesture stream.
+    //
+    // One deliberate exception: a front app that binds a source to `None`
+    // means "leave it native" (firmware feel, no frozen cursor while held), so
+    // that app still releases the source — accepting a re-arm for that case.
+    let front_app_releases = |button: &ButtonId| {
+        GESTURE_SOURCE_BUTTONS
+            .iter()
+            .any(|(_, source)| source == button)
+            && bindings
+                .get(button)
+                .is_some_and(|binding| binding == &Binding::Single(Action::None))
+    };
+    let mut spec_gesture_bindings = hidpp_gesture_maps_for(config, Some(config_key), None);
+    spec_gesture_bindings.retain(|button, _| !front_app_releases(button));
+    let all_profiles = all_profile_bindings(config, config_key);
     let mut divert_gesture_buttons = Vec::new();
     if os_mouse_hook_available {
         divert_gesture_buttons.extend(
@@ -128,7 +195,7 @@ pub fn plan_for_device(
                 .filter(|(_, button)| side_gesture_bindings.contains_key(button)),
         );
     }
-    if gesture_bindings.contains_key(&ButtonId::DpiToggle) {
+    if spec_gesture_bindings.contains_key(&ButtonId::DpiToggle) {
         divert_gesture_buttons.extend(
             DPI_MODE_SHIFT_CIDS
                 .into_iter()
@@ -141,7 +208,7 @@ pub fn plan_for_device(
     // owns a gesturing source's CID).
     let plain_sources = GESTURE_SOURCE_BUTTONS
         .into_iter()
-        .filter(|(_, button)| !gesture_bindings.contains_key(button));
+        .filter(|(_, button)| !spec_gesture_bindings.contains_key(button));
     let divert_buttons: Vec<(u16, ButtonId)> = DIVERTABLE_STANDARD_BUTTONS
         .into_iter()
         .chain(plain_sources)
@@ -153,32 +220,30 @@ pub fn plan_for_device(
         })
         .filter(|(_, button)| !oshook.contains_key(button))
         .filter(|(_, button)| {
-            bindings.get(button).is_some_and(|binding| {
-                if matches!(binding, Binding::LongPress(_)) {
-                    return true;
-                }
-                let action = binding.click_action();
-                // Gesture sources have no host-visible firmware action, so any
-                // single binding needs the divert. `None` leaves them native.
-                if GESTURE_SOURCE_BUTTONS.iter().any(|(_, source)| source == button) {
-                    action != Action::None
-                } else {
-                    action != default_binding(*button)
-                }
-            })
+            // HID++-only gesture sources are decided across every profile (see
+            // `spec_gesture_bindings`); OS-hook buttons keep following the
+            // front app, where native vs injected behaviour differs.
+            if GESTURE_SOURCE_BUTTONS.iter().any(|(_, source)| source == button) {
+                !front_app_releases(button)
+                    && all_profiles
+                        .iter()
+                        .any(|profile| wants_plain_divert(profile, *button))
+            } else {
+                wants_plain_divert(&bindings, *button)
+            }
         })
         .collect();
-    let thumbwheel_bindings_nondefault = [
-        ButtonId::Thumbwheel,
-        ButtonId::ThumbwheelScrollUp,
-        ButtonId::ThumbwheelScrollDown,
-    ]
-    .iter()
-    .any(|button| {
-        bindings
-            .get(button)
-            .is_some_and(|binding| binding.click_action() != default_binding(*button))
-    });
+    // Thumb-wheel diversion is decided across EVERY app profile, not just the
+    // app in front. Otherwise one per-app wheel binding (say, tab switching in
+    // a browser) flips the capture target on each app switch, and every flip
+    // tears the whole control session down and re-diverts it over HID++ —
+    // hundreds of Bluetooth round trips a day, each a window where the mouse
+    // briefly reverts to firmware behaviour. The action itself still follows
+    // the front app: dispatch-only changes hot-swap without touching the
+    // device, and a default binding is emulated as native horizontal scroll.
+    // Base bindings plus every profile, and deliberately NOT the front app's
+    // effective map: the answer must be identical whichever app is in front.
+    let thumbwheel_bindings_nondefault = all_profiles.iter().any(thumbwheel_nondefault);
     let thumbwheel_sensitivity = config.thumbwheel_sensitivity(config_key);
     DeviceCapturePlan {
         target: CaptureTarget {
@@ -189,7 +254,7 @@ pub fn plan_for_device(
                     || thumbwheel_bindings_nondefault,
                 divert_gesture_sources: GESTURE_SOURCE_BUTTONS
                     .into_iter()
-                    .filter(|(_, button)| gesture_bindings.contains_key(button))
+                    .filter(|(_, button)| spec_gesture_bindings.contains_key(button))
                     .map(|(cid, _)| cid)
                     .collect(),
                 divert_gesture_buttons,
@@ -380,6 +445,82 @@ mod tests {
     }
 
     #[test]
+    fn a_per_app_thumbwheel_binding_keeps_one_capture_target_across_apps() {
+        // Shane's config: Chrome maps the thumb wheel to tab switching, every
+        // other app keeps horizontal scroll. Switching apps must only change
+        // dispatch, never the capture target, or each switch re-diverts the
+        // whole device over HID++.
+        let mut cfg = Config::default();
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.google.Chrome",
+            ButtonId::ThumbwheelScrollUp,
+            Some(Action::NextTab),
+        );
+        let plans: Vec<_> = [None, Some("com.google.Chrome"), Some("com.apple.Notes")]
+            .into_iter()
+            .map(|app| plan_for_device(&cfg, "2b042", route(), app, 0, true))
+            .collect();
+        for plan in &plans {
+            assert!(plan.target.spec.capture_thumbwheel);
+            assert_eq!(
+                plan.target, plans[0].target,
+                "capture target must not follow the app"
+            );
+        }
+        assert_eq!(
+            plans[1]
+                .dispatch
+                .bindings
+                .get(&ButtonId::ThumbwheelScrollUp),
+            Some(&Binding::Single(Action::NextTab)),
+            "the front app still picks the action"
+        );
+        assert_ne!(
+            plans[2]
+                .dispatch
+                .bindings
+                .get(&ButtonId::ThumbwheelScrollUp),
+            Some(&Binding::Single(Action::NextTab)),
+            "other apps keep their own wheel action"
+        );
+
+        assert_eq!(
+            plans[2]
+                .dispatch
+                .bindings
+                .get(&ButtonId::ThumbwheelScrollUp),
+            Some(&Binding::Single(Action::HorizontalScrollLeft)),
+            "an app without a profile scrolls horizontally, as the firmware would"
+        );
+
+        // With no wheel binding anywhere the wheel stays fully native.
+        let native = plan_for_device(&Config::default(), "2b042", route(), None, 0, true);
+        assert!(!native.target.spec.capture_thumbwheel);
+
+        // A non-default BASE binding that one profile resets to the default
+        // must not make the profile's app the odd one out either.
+        let mut cfg = Config::default();
+        cfg.set_binding(
+            "2b042",
+            ButtonId::ThumbwheelScrollUp,
+            Binding::Single(Action::VolumeUp),
+        );
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.google.Chrome",
+            ButtonId::ThumbwheelScrollUp,
+            Some(Action::HorizontalScrollLeft),
+        );
+        let targets: Vec<_> = [None, Some("com.google.Chrome"), Some("com.apple.Notes")]
+            .into_iter()
+            .map(|app| plan_for_device(&cfg, "2b042", route(), app, 0, true).target)
+            .collect();
+        assert!(targets.iter().all(|t| t.spec.capture_thumbwheel));
+        assert!(targets.iter().all(|t| *t == targets[0]));
+    }
+
+    #[test]
     fn thumb_button_capture_follows_per_app_overrides_and_inheritance() {
         for (button, native, browser) in [
             (ButtonId::Back, Action::MouseBack, Action::BrowserBack),
@@ -434,6 +575,101 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_per_app_single_binding_on_a_gesturing_panel_keeps_one_capture_target() {
+        // Shane's config: the haptic panel gestures everywhere, but one editor
+        // profile single-binds it to the Actions Ring.
+        let mut cfg = Config::default();
+        cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
+        cfg.set_per_app_binding(
+            "2b042",
+            "dev.zcode.app",
+            ButtonId::HapticPanel,
+            Some(Action::ShowActionsRing),
+        );
+        let plans: Vec<_> = [None, Some("dev.zcode.app"), Some("com.apple.Notes")]
+            .into_iter()
+            .map(|app| plan_for_device(&cfg, "2b042", route(), app, 0, true))
+            .collect();
+        for plan in &plans {
+            assert_eq!(
+                plan.target, plans[0].target,
+                "capture target must not follow the app"
+            );
+            assert!(
+                plan.target
+                    .spec
+                    .divert_gesture_sources
+                    .contains(&HAPTIC_PANEL_CID)
+            );
+            assert!(
+                !plan
+                    .target
+                    .spec
+                    .divert_buttons
+                    .iter()
+                    .any(|&(cid, _)| cid == HAPTIC_PANEL_CID),
+                "a raw-XY gesture divert owns the panel; a plain divert would strip it"
+            );
+        }
+        // Dispatch still follows the app: the editor sees a single action...
+        assert!(
+            !plans[1]
+                .dispatch
+                .gesture_bindings
+                .contains_key(&ButtonId::HapticPanel)
+        );
+        assert_eq!(
+            plans[1].dispatch.bindings.get(&ButtonId::HapticPanel),
+            Some(&Binding::Single(Action::ShowActionsRing))
+        );
+        // ...and everywhere else the panel keeps its gesture map.
+        assert!(
+            plans[2]
+                .dispatch
+                .gesture_bindings
+                .contains_key(&ButtonId::HapticPanel)
+        );
+    }
+
+    #[test]
+    fn a_per_app_none_on_a_gesturing_panel_still_releases_it_in_that_app() {
+        // `None` means "leave the panel native" — honoured per app even though
+        // it costs a re-arm on switching to that app.
+        let mut cfg = Config::default();
+        cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.example.Game",
+            ButtonId::HapticPanel,
+            Some(Action::None),
+        );
+        let in_game = plan_for_device(&cfg, "2b042", route(), Some("com.example.Game"), 0, true);
+        assert!(
+            !in_game
+                .target
+                .spec
+                .divert_gesture_sources
+                .contains(&HAPTIC_PANEL_CID)
+        );
+        assert!(
+            !in_game
+                .target
+                .spec
+                .divert_buttons
+                .iter()
+                .any(|&(cid, _)| cid == HAPTIC_PANEL_CID)
+        );
+        let elsewhere = plan_for_device(&cfg, "2b042", route(), Some("com.apple.Notes"), 0, true);
+        assert!(
+            elsewhere
+                .target
+                .spec
+                .divert_gesture_sources
+                .contains(&HAPTIC_PANEL_CID)
+        );
     }
 
     #[test]
@@ -684,6 +920,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_gesture_mode("2b042", ButtonId::DpiToggle, true);
         for action in [Action::Paste, Action::None] {
+            let base_target = plan_for_device(&cfg, "2b042", route(), None, 0, false).target;
             cfg.set_per_app_binding(
                 "2b042",
                 "com.example.Editor",
@@ -699,13 +936,18 @@ mod tests {
                         .contains_key(&ButtonId::DpiToggle),
                     !overridden
                 );
+                // The device keeps its raw-XY divert in every app; only
+                // dispatch changes, so switching apps never re-arms.
                 assert_eq!(
+                    plan.target, base_target,
+                    "DPI capture must not follow the app"
+                );
+                assert!(
                     plan.target
                         .spec
                         .divert_gesture_buttons
                         .iter()
-                        .any(|&(_, button)| button == ButtonId::DpiToggle),
-                    !overridden
+                        .any(|&(_, button)| button == ButtonId::DpiToggle)
                 );
                 if overridden {
                     assert_eq!(
