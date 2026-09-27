@@ -45,6 +45,11 @@ grep -q '^\[package.metadata.bundle.macos\]' "$REPO/crates/openlogi-desktop/Carg
 if [[ ! -e "$REPO/target" ]]; then
   ln -s "$HOME/.cargo/shared-target" "$REPO/target"   # xtask hard-codes <repo>/target
 fi
+# The installed build must be exactly a commit, so it can be traced and rebuilt.
+if [[ -n "$(git -C "$REPO" status --porcelain --untracked-files=no)" ]]; then
+  git -C "$REPO" status --short --untracked-files=no >&2
+  die "uncommitted changes in $REPO — commit or stash them first"
+fi
 COMMIT="$(git -C "$REPO" rev-parse --short HEAD)"
 BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
 echo "branch $BRANCH @ $COMMIT, identity: $IDENTITY"
