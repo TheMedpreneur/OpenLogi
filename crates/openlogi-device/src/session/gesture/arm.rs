@@ -8,6 +8,7 @@ use hidpp::{channel::HidppChannel, device::Device};
 use openlogi_core::binding::ButtonId;
 use tracing::{debug, warn};
 
+use super::accum::{CaptureAccum, FirstRawXyPolicy};
 use super::{CaptureSpec, CapturedInput};
 use crate::reprog_controls::{self, ReprogControlsV4};
 use crate::session::capture::open_device;
@@ -23,6 +24,8 @@ use crate::{ChannelRegistry, SharedChannel};
 /// to the firmware on teardown.
 #[derive(Default)]
 pub(super) struct ArmedControls {
+    /// Initial-report quirk discovered from the complete device control table.
+    pub(super) first_raw_xy_policy: FirstRawXyPolicy,
     /// `0x1b04` accessor, present when the device exposes it.
     pub(super) reprog: Option<ReprogControlsV4>,
     /// The gesture-source CIDs diverted with raw-XY reporting: the
@@ -64,6 +67,13 @@ impl ArmedThumbwheel {
 }
 
 impl ArmedControls {
+    /// A fresh report accumulator carrying this device's first-report policy.
+    /// Used both when a session starts and after a reconnect resets state, so
+    /// the hardware quirk can never be dropped by a reset.
+    pub(super) fn capture_accum(&self) -> CaptureAccum {
+        CaptureAccum::with_policy(self.first_raw_xy_policy)
+    }
+
     /// Build the one-time polarity fact learned while arming the thumb wheel.
     pub(super) fn thumbwheel_direction(&self) -> Option<CapturedInput> {
         let positive_is_forward = self
@@ -172,6 +182,8 @@ pub(super) async fn arm_controls_into(
     {
         let rc = ReprogControlsV4::new(Arc::clone(chan), slot, info.index);
         let controls = enumerate_controls(&rc).await?;
+        armed.first_raw_xy_policy =
+            FirstRawXyPolicy::from_control_ids(controls.iter().map(|control| control.cid));
         // Register an accessor before the first divert, so a failure on any
         // divert (including the first) can become a restore capability.
         armed.reprog = Some(rc.clone());

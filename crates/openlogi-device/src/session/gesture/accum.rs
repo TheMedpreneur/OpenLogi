@@ -29,9 +29,9 @@ enum HoldState {
         /// A second armed source is held alongside the holder. Overlap motion
         /// could belong to either control — dropped until the overlap ends.
         overlap: bool,
-        /// The hold's next raw-XY sample must be dropped: the haptic panel's
-        /// first sample after contact is an absolute position jump, not a
-        /// delta (see [`reprog_controls::HAPTIC_PANEL_CID`]).
+        /// Drop the hold's first report when the device's control table
+        /// identifies a source with a stale initial raw-XY sample (see
+        /// [`FirstRawXyPolicy`]).
         skip_first_raw_xy: bool,
     },
 }
@@ -39,7 +39,16 @@ enum HoldState {
 /// Begin a hold for `cid`, its swipe accumulator started fresh.
 fn begin_hold(cid: u16, button: ButtonId, overlap: bool, skip_first_raw_xy: bool) -> HoldState {
     let mut swipe = SwipeAccumulator::default();
-    swipe.begin();
+    // Dedicated gesture controls (thumb button, haptic panel) exist only to
+    // gesture, so a fast deliberate swipe commits on distance alone. Every
+    // other source — side buttons, and DPI/ModeShift even though it is also a
+    // HID++ gesture source — is clicked in normal use and keeps the
+    // click-drift hold gate.
+    if matches!(button, ButtonId::GestureButton | ButtonId::HapticPanel) {
+        swipe.begin_dedicated();
+    } else {
+        swipe.begin();
+    }
     HoldState::Holding {
         cid,
         button,
@@ -49,15 +58,46 @@ fn begin_hold(cid: u16, button: ButtonId, overlap: bool, skip_first_raw_xy: bool
     }
 }
 
+/// Hardware-specific first-report handling, derived from the live control table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum FirstRawXyPolicy {
+    /// Only the haptic panel's first sample (a contact jump) is dropped.
+    #[default]
+    PanelOnly,
+    /// MX Master 4 exposes the vendor-specific haptic panel. Hardware traces
+    /// show stale initial travel on its dedicated gesture button as well.
+    HapticDevice,
+}
+
+impl FirstRawXyPolicy {
+    pub(super) fn from_control_ids(cids: impl IntoIterator<Item = u16>) -> Self {
+        if cids
+            .into_iter()
+            .any(|cid| cid == reprog_controls::HAPTIC_PANEL_CID)
+        {
+            Self::HapticDevice
+        } else {
+            Self::PanelOnly
+        }
+    }
+
+    fn skips(self, cid: u16) -> bool {
+        cid == reprog_controls::HAPTIC_PANEL_CID
+            || (matches!(self, Self::HapticDevice) && cid == reprog_controls::GESTURE_BUTTON_CID)
+    }
+}
+
 /// Movement + button state accumulated across messages. Lives behind a `Mutex`
 /// because the channel's read thread invokes the listener by shared reference.
 #[derive(Default)]
 pub(super) struct CaptureAccum {
+    /// Device policy retained when capture state is reset after a reconnect.
+    first_raw_xy_policy: FirstRawXyPolicy,
     /// The hold owning raw-XY motion, if any (see [`HoldState`]).
     hold: HoldState,
     /// The armed gesture sources held in the last event, for edge detection:
     /// a source not previously held that becomes the holder is a fresh touch
-    /// (the haptic panel's first sample is then a contact jump to discard).
+    /// (a source covered by the device policy then drops its initial sample).
     gestures_down: Vec<u16>,
     /// Whether any DPI/ModeShift control was held in the last event — for
     /// rising-edge press detection.
@@ -98,6 +138,14 @@ fn captured_gesture_button(cid: u16, gesture_button_cids: &[(u16, ButtonId)]) ->
 }
 
 impl CaptureAccum {
+    /// A fresh accumulator that applies `policy` to every new hold.
+    pub(super) fn with_policy(policy: FirstRawXyPolicy) -> Self {
+        Self {
+            first_raw_xy_policy: policy,
+            ..Self::default()
+        }
+    }
+
     /// Update the accumulator and emit on a decoded `0x1b04` event: preserve
     /// physical button edges, and commit a gesture swipe the instant it
     /// crosses the threshold (mid-swipe, like Options+) rather than on release.
@@ -158,7 +206,7 @@ impl CaptureAccum {
                         }
                         // ...and the first still-held source begins (or takes
                         // over) the hold. A source not down in the previous event
-                        // is a fresh touch, so the panel's contact-jump discard
+                        // is a fresh touch, so the device's first-report discard
                         // applies; one that was already held has had its jump
                         // dropped during the overlap.
                         match held.first() {
@@ -166,7 +214,7 @@ impl CaptureAccum {
                                 cid,
                                 button,
                                 held.len() > 1,
-                                cid == reprog_controls::HAPTIC_PANEL_CID
+                                self.first_raw_xy_policy.skips(cid)
                                     && !self.gestures_down.contains(&cid),
                             ),
                             None => HoldState::Idle,
@@ -235,15 +283,15 @@ impl CaptureAccum {
         if *overlap {
             return;
         }
-        // The haptic panel's first sample after contact is a position jump;
+        // A stale first sample can carry pre-press travel or a contact jump;
         // summing it would commit a bogus direction instantly.
         if *skip_first_raw_xy {
             *skip_first_raw_xy = false;
             return;
         }
         // Commit the instant a clean direction emerges (mid-swipe, once per hold);
-        // the accumulator gates on hold duration internally and drops travel that
-        // arrives outside a hold.
+        // the accumulator applies the control's timing policy and drops travel
+        // that arrives outside a hold.
         if let Some(direction) = swipe.accumulate(i32::from(dx), i32::from(dy)) {
             debug!(?direction, %button, "gesture committed");
             let _ = sink.send(CapturedInput::Gesture(*button, direction));

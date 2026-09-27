@@ -1,6 +1,7 @@
 //! The capture accumulator: presses, taps, swipes and raw XY across the gesture sources.
 
 use super::*;
+use crate::session::gesture::accum::FirstRawXyPolicy;
 
 const GESTURE: &[u16] = &[reprog_controls::GESTURE_BUTTON_CID];
 
@@ -187,7 +188,7 @@ fn a_same_report_swap_to_the_panel_still_discards_its_contact_jump() {
 }
 
 #[test]
-fn quick_tap_is_a_click_even_while_the_cursor_moves() {
+fn dedicated_quick_swipe_is_not_misclassified_as_click() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut acc = CaptureAccum::default();
 
@@ -206,12 +207,12 @@ fn quick_tap_is_a_click_even_while_the_cursor_moves() {
         next_gesture(&mut rx),
         Ok(CapturedInput::Gesture(
             ButtonId::GestureButton,
-            GestureDirection::Click
+            GestureDirection::Right
         ))
     );
     assert!(
         next_gesture(&mut rx).is_err(),
-        "a quick tap emits exactly one click"
+        "a quick swipe emits exactly one direction, without a release click"
     );
 }
 
@@ -321,7 +322,6 @@ fn the_panels_first_raw_xy_sample_after_contact_is_discarded() {
     let mut acc = CaptureAccum::default();
 
     handle_reprog(&mut acc, panel_press(), PANEL, &[], &[], &tx);
-    acc.backdate_hold_for_test();
     // The contact jump — leftward, far past every threshold.
     handle_reprog(
         &mut acc,
@@ -356,10 +356,10 @@ fn the_panels_first_raw_xy_sample_after_contact_is_discarded() {
 
 #[test]
 fn the_dedicated_buttons_first_sample_is_not_discarded() {
-    // The discard is a panel quirk: the dedicated button's raw-XY stream is
-    // relative from the first sample, which must keep committing as-is.
+    // Devices without a haptic panel keep their first dedicated-button delta.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut acc = CaptureAccum::default();
+    let mut acc =
+        CaptureAccum::with_policy(FirstRawXyPolicy::from_control_ids(GESTURE.iter().copied()));
 
     handle_reprog(&mut acc, press(), GESTURE, &[], &[], &tx);
     acc.backdate_hold_for_test();
@@ -672,4 +672,234 @@ fn a_dpi_button_re_presses_after_a_release() {
         rx.try_recv().is_err(),
         "press → release → press emits exactly three lifecycle edges"
     );
+}
+
+#[test]
+fn dedicated_swipe_commits_immediately_and_ignores_opposite_recovery() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut acc = CaptureAccum::default();
+    handle_reprog(&mut acc, press(), GESTURE, &[], &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: -120, dy: 5 },
+        GESTURE,
+        &[],
+        &[],
+        &tx,
+    );
+    assert_eq!(
+        next_gesture(&mut rx),
+        Ok(CapturedInput::Gesture(
+            ButtonId::GestureButton,
+            GestureDirection::Left,
+        )),
+        "a deliberate dedicated-button swipe must not wait 160 ms"
+    );
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 300, dy: 0 },
+        GESTURE,
+        &[],
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, release(), GESTURE, &[], &[], &tx);
+    assert!(
+        next_gesture(&mut rx).is_err(),
+        "recovery and release must not emit another action"
+    );
+}
+
+#[test]
+fn side_button_raw_xy_still_waits_for_the_hold_gate() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut acc = CaptureAccum::default();
+    let cid = 0x0056;
+    let buttons = [(cid, ButtonId::Forward)];
+    acc.on_event(
+        RawControlEvent::DivertedButtons([cid, 0, 0, 0]),
+        &[],
+        &[],
+        &buttons,
+        &[],
+        &tx,
+    );
+    acc.on_event(
+        RawControlEvent::RawXy { dx: -120, dy: 5 },
+        &[],
+        &[],
+        &buttons,
+        &[],
+        &tx,
+    );
+    assert!(
+        next_gesture(&mut rx).is_err(),
+        "ordinary buttons retain click-drift protection"
+    );
+    acc.backdate_hold_for_test();
+    acc.on_event(
+        RawControlEvent::RawXy { dx: -1, dy: 0 },
+        &[],
+        &[],
+        &buttons,
+        &[],
+        &tx,
+    );
+    assert_eq!(
+        next_gesture(&mut rx),
+        Ok(CapturedInput::Gesture(
+            ButtonId::Forward,
+            GestureDirection::Left,
+        ))
+    );
+}
+
+#[test]
+fn haptic_device_dedicated_button_ignores_stale_first_motion() {
+    // Two leftward holds captured on an MX Master 4 (PR #1301): the first
+    // packet carries rightward travel from before the press, then real left
+    // motion. Without the discard these committed Right.
+    let policy = FirstRawXyPolicy::from_control_ids(BOTH.iter().copied());
+    for samples in [
+        vec![(2041, -74), (-21, -5), (-21, -4), (-25, -4)],
+        vec![(252, 34), (-37, -4), (-23, -2)],
+    ] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut acc = CaptureAccum::with_policy(policy);
+        handle_reprog(&mut acc, press(), GESTURE, &[], &[], &tx);
+        for (dx, dy) in samples {
+            handle_reprog(
+                &mut acc,
+                RawControlEvent::RawXy { dx, dy },
+                GESTURE,
+                &[],
+                &[],
+                &tx,
+            );
+        }
+        assert_eq!(
+            next_gesture(&mut rx),
+            Ok(CapturedInput::Gesture(
+                ButtonId::GestureButton,
+                GestureDirection::Left,
+            ))
+        );
+        assert!(next_gesture(&mut rx).is_err(), "one action per hold");
+    }
+}
+
+#[test]
+fn haptic_device_dedicated_takeover_only_discards_on_a_fresh_press() {
+    for overlaps in [false, true] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut acc =
+            CaptureAccum::with_policy(FirstRawXyPolicy::from_control_ids(BOTH.iter().copied()));
+        handle_reprog(&mut acc, panel_press(), BOTH, &[], &[], &tx);
+        if overlaps {
+            handle_reprog(&mut acc, both_press(), BOTH, &[], &[], &tx);
+            handle_reprog(
+                &mut acc,
+                RawControlEvent::RawXy { dx: 2041, dy: -74 },
+                BOTH,
+                &[],
+                &[],
+                &tx,
+            );
+        }
+        handle_reprog(&mut acc, press(), BOTH, &[], &[], &tx);
+        assert_eq!(
+            next_gesture(&mut rx),
+            Ok(CapturedInput::Gesture(
+                ButtonId::HapticPanel,
+                GestureDirection::Click
+            ))
+        );
+        if !overlaps {
+            handle_reprog(
+                &mut acc,
+                RawControlEvent::RawXy { dx: 2041, dy: -74 },
+                BOTH,
+                &[],
+                &[],
+                &tx,
+            );
+            assert!(
+                next_gesture(&mut rx).is_err(),
+                "fresh press drops stale sample"
+            );
+        }
+        handle_reprog(
+            &mut acc,
+            RawControlEvent::RawXy { dx: -120, dy: -5 },
+            BOTH,
+            &[],
+            &[],
+            &tx,
+        );
+        assert_eq!(
+            next_gesture(&mut rx),
+            Ok(CapturedInput::Gesture(
+                ButtonId::GestureButton,
+                GestureDirection::Left
+            ))
+        );
+    }
+}
+
+#[test]
+fn a_reconnect_reset_keeps_the_haptic_device_policy() {
+    // Regression guard for the port onto the split module: resetting capture
+    // state after a wireless reconnect must not fall back to PanelOnly.
+    let mut armed = ArmedControls::default();
+    armed.first_raw_xy_policy = FirstRawXyPolicy::from_control_ids(BOTH.iter().copied());
+    let capture = GestureCapture::new(armed);
+    // A reconnect broadcast resets input state through the ArmedCapture hook.
+    capture.reset_input_state();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut acc = capture.accum.lock().unwrap_or_else(PoisonError::into_inner);
+    handle_reprog(&mut acc, press(), GESTURE, &[], &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 2041, dy: -74 },
+        GESTURE,
+        &[],
+        &[],
+        &tx,
+    );
+    assert!(next_gesture(&mut rx).is_err(), "stale first sample dropped");
+}
+
+#[test]
+fn a_quick_dpi_gesture_press_with_drift_is_still_a_click() {
+    // DPI/ModeShift is a HID++ gesture source but an ordinary button in daily
+    // use: it keeps the click-drift hold gate the dedicated controls dropped.
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut acc = CaptureAccum::default();
+    let cid = reprog_controls::DPI_MODE_SHIFT_CIDS[0];
+    let buttons = [(cid, ButtonId::DpiToggle)];
+    acc.on_event(
+        RawControlEvent::DivertedButtons([cid, 0, 0, 0]),
+        &[],
+        &[],
+        &buttons,
+        &[],
+        &tx,
+    );
+    acc.on_event(
+        RawControlEvent::RawXy { dx: -120, dy: 5 },
+        &[],
+        &[],
+        &buttons,
+        &[],
+        &tx,
+    );
+    acc.on_event(release(), &[], &[], &buttons, &[], &tx);
+    assert_eq!(
+        next_gesture(&mut rx),
+        Ok(CapturedInput::Gesture(
+            ButtonId::DpiToggle,
+            GestureDirection::Click
+        ))
+    );
+    assert!(next_gesture(&mut rx).is_err(), "exactly one click");
 }
