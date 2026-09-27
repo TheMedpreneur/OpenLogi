@@ -75,10 +75,51 @@ fn display_label(presentation: &openlogi_ipc::ActionRingPresentation) -> SharedS
     SharedString::from(label)
 }
 
+/// The two hit areas that make up one slot.
+#[derive(Clone, Copy)]
+enum SlotPart {
+    Circle,
+    Caption,
+}
+
+#[derive(Default)]
+struct HoverParts {
+    circle: Option<ActionRingSlot>,
+    caption: Option<ActionRingSlot>,
+}
+
+impl HoverParts {
+    /// Record one part's hover edge; returns the slot that should now read as
+    /// hovered.
+    fn update(
+        &mut self,
+        slot: ActionRingSlot,
+        part: SlotPart,
+        hovered: bool,
+    ) -> Option<ActionRingSlot> {
+        let field = match part {
+            SlotPart::Circle => &mut self.circle,
+            SlotPart::Caption => &mut self.caption,
+        };
+        if hovered {
+            *field = Some(slot);
+        } else if *field == Some(slot) {
+            *field = None;
+        }
+        // The caption is on top, so it wins while both claim a slot.
+        self.caption.or(self.circle)
+    }
+}
+
 pub(crate) struct RingView {
     invocation: ActionRingInvocation,
     commands: mpsc::UnboundedSender<OverlayCommand>,
     hovered: Option<ActionRingSlot>,
+    /// Which slot's circle and which slot's caption the pointer is over. A
+    /// slot stays highlighted while either part is hovered; tracking them
+    /// separately means the order gpui delivers the two parts' hover events in
+    /// (caption first — it is drawn on top) can never clear a live highlight.
+    hover_parts: HoverParts,
     /// Publishes click-away identity for exactly this view's lifetime.
     _showing: ShowingRing,
 }
@@ -95,6 +136,7 @@ impl RingView {
             invocation,
             commands,
             hovered: None,
+            hover_parts: HoverParts::default(),
             _showing: showing,
         }
     }
@@ -148,16 +190,7 @@ impl RingView {
                 .cursor_pointer()
                 .child(svg().path(icon_path).size(px(20.0)).text_color(GLYPH))
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    if *hovered && this.hovered != Some(slot) {
-                        this.hovered = Some(slot);
-                        let _ = this
-                            .commands
-                            .send(OverlayCommand::Hover { session_id, slot });
-                        cx.notify();
-                    } else if !*hovered && this.hovered == Some(slot) {
-                        this.hovered = None;
-                        cx.notify();
-                    }
+                    this.on_part_hover(slot, SlotPart::Circle, *hovered, cx);
                 }))
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -170,6 +203,29 @@ impl RingView {
 }
 
 impl RingView {
+    /// Fold one part's hover edge into the slot highlight, reporting a newly
+    /// hovered slot to the agent (which drives the haptic buzz).
+    fn on_part_hover(
+        &mut self,
+        slot: ActionRingSlot,
+        part: SlotPart,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.hover_parts.update(slot, part, hovered);
+        if next == self.hovered {
+            return;
+        }
+        self.hovered = next;
+        if let Some(slot) = next {
+            let _ = self.commands.send(OverlayCommand::Hover {
+                session_id: self.invocation.session_id,
+                slot,
+            });
+        }
+        cx.notify();
+    }
+
     /// A slot's caption: centred under the slot on a dark pill, truncated to
     /// [`CAPTION_WIDTH`], and wired to the same hover and activation as the
     /// slot itself.
@@ -188,7 +244,8 @@ impl RingView {
                 .id(("ring-caption", slot.index()))
                 .absolute()
                 .left(px(left + SLOT_SIZE / 2.0 - CAPTION_WIDTH / 2.0))
-                .top(px(top + SLOT_SIZE + 2.0))
+                .top(px(top + SLOT_SIZE))
+                .pt(px(2.0))
                 .w(px(CAPTION_WIDTH))
                 .flex()
                 .justify_center()
@@ -207,16 +264,7 @@ impl RingView {
                         .child(display_label(presentation)),
                 )
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    if *hovered && this.hovered != Some(slot) {
-                        this.hovered = Some(slot);
-                        let _ = this
-                            .commands
-                            .send(OverlayCommand::Hover { session_id, slot });
-                        cx.notify();
-                    } else if !*hovered && this.hovered == Some(slot) {
-                        this.hovered = None;
-                        cx.notify();
-                    }
+                    this.on_part_hover(slot, SlotPart::Caption, *hovered, cx);
                 }))
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -365,6 +413,40 @@ mod tests {
         assert_eq!(
             clamp_window_origin(desired, Size::new(px(400.0), px(400.0)), display),
             desired
+        );
+    }
+}
+
+#[cfg(test)]
+mod hover_part_tests {
+    use super::*;
+
+    #[test]
+    fn a_fast_move_from_circle_to_caption_keeps_the_slot_highlighted() {
+        // gpui delivers the caption's edge first (it is drawn on top).
+        let mut parts = HoverParts::default();
+        let slot = ActionRingSlot::Bottom;
+        assert_eq!(parts.update(slot, SlotPart::Circle, true), Some(slot));
+        assert_eq!(parts.update(slot, SlotPart::Caption, true), Some(slot));
+        assert_eq!(parts.update(slot, SlotPart::Circle, false), Some(slot));
+        assert_eq!(parts.update(slot, SlotPart::Caption, false), None);
+    }
+
+    #[test]
+    fn moving_to_another_slot_hands_the_highlight_over() {
+        let mut parts = HoverParts::default();
+        assert_eq!(
+            parts.update(ActionRingSlot::Top, SlotPart::Circle, true),
+            Some(ActionRingSlot::Top)
+        );
+        assert_eq!(
+            parts.update(ActionRingSlot::TopRight, SlotPart::Circle, true),
+            Some(ActionRingSlot::TopRight)
+        );
+        // A late unhover for the old slot must not clear the new one.
+        assert_eq!(
+            parts.update(ActionRingSlot::Top, SlotPart::Circle, false),
+            Some(ActionRingSlot::TopRight)
         );
     }
 }
