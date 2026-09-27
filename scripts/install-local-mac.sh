@@ -141,7 +141,6 @@ sed -i '' 's/^auto_install_updates = true$/auto_install_updates = false/' "$CONF
 # ── restart + verify ────────────────────────────────────────────────────────
 step "restart agent + app"
 SINCE="$(date -u +%Y-%m-%dT%H:%M:%S)"
-sleep 1   # nothing the old agent logs in this second can count as fresh
 launchctl kickstart -k "$SERVICE" || die "could not restart $SERVICE"
 open -a "$APP_DST"
 
@@ -150,13 +149,15 @@ ok=0
 for _ in $(seq 1 30); do
   sleep 2
   # recomputed every pass: the UTC day can roll over while we wait
-  recent="$(awk -v s="$SINCE" '$1 > s' "$(agent_log)" 2>/dev/null || true)"
-  # only what the NEW agent logged counts
-  recent="$(awk 'found || /openlogi-agent started/ {found=1; print}' <<<"$recent")"
-  if grep -q "could not load config.toml" <<<"$recent"; then
+  since="$(awk -v s="$SINCE" '$1 > s' "$(agent_log)" 2>/dev/null || true)"
+  # The config is parsed before the agent announces itself, so check the
+  # whole window for these; the old agent logs neither while shutting down.
+  if grep -q "could not load config.toml" <<<"$since"; then
     die "the agent rejected config.toml and fell back to defaults"
   fi
-  if grep -q "Input Monitoring is NOT granted" <<<"$recent"; then
+  # Capture only counts once the NEW agent has announced itself.
+  recent="$(awk 'found || /openlogi-agent started/ {found=1; print}' <<<"$since")"
+  if grep -q "Input Monitoring is NOT granted" <<<"$since"; then
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
     die "Input Monitoring is off for OpenLogi Agent — turn it on in the pane just opened, then re-run with --skip-tests"
   fi
