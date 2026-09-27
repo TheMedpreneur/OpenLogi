@@ -40,7 +40,7 @@ files; **keep this table in sync when you add or move one**:
 | `openlogi-inject/src/inject/macos/scroll.rs` | CGEvent scroll synthesis, including the continuous-scroll phase fields |
 | `openlogi-inject/src/inject/macos/browser.rs` | typed `AXUIElement` navigation with `CFRetained` ownership, and the off-thread `NSWorkspace` Safari validation |
 | `openlogi-inject/src/inject/macos/{app_services,dock,symbolic_hotkey}.rs` | the `dlopen`'d private SPIs: `CoreDockSendNotification` and the CGS symbolic-hotkey trio |
-| `openlogi-overlay/src/platform.rs` | the Actions Ring helper's window policy: accessory activation, non-activating panel, the frosted-glass `NSVisualEffectView` circle mask (`NSImage` drawing handler, `block2`), the `NSEvent` global click-away monitor (`block2`), and `CGGetActiveDisplayList` / `CGDisplayBounds` |
+| `openlogi-overlay/src/platform.rs` | the Actions Ring helper's window policy: accessory activation, non-activating panel, the `NSEvent` global click-away monitor (`block2`), and `CGGetActiveDisplayList` / `CGDisplayBounds` |
 | `openlogi-permissions/src/macos.rs` | non-prompting permission reads + System-Settings deep links; `+[CBManager authorization]` via an `AnyClass` lookup |
 
 Every rule below binds all of them, whichever crate they live in.
