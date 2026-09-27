@@ -30,6 +30,10 @@ pub(crate) const RADIUS: f32 = 118.0;
 /// to make room inside the unchanged 360 px window.
 const CAPTION_WIDTH: f32 = 84.0;
 const CAPTION_RESTING: Hsla = neutral(0.78, 1.0);
+/// Each caption sits on its own pill in the panel's colour, so a caption that
+/// reaches past the round panel (the lower slots sit near its rim) still reads
+/// over whatever is on the desktop behind the transparent window.
+const CAPTION_PILL: Hsla = neutral(0.08, 0.92);
 
 /// The ring's own neutral scale. It floats over whatever is on the desktop, so
 /// unlike the settings app it cannot take its surfaces from the OS appearance —
@@ -165,6 +169,65 @@ impl RingView {
     }
 }
 
+impl RingView {
+    /// A slot's caption: centred under the slot on a dark pill, truncated to
+    /// [`CAPTION_WIDTH`], and wired to the same hover and activation as the
+    /// slot itself.
+    fn caption_element(
+        &self,
+        slot: ActionRingSlot,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let presentation = self.invocation.slots.get(&slot)?;
+        let (left, top) = slot.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
+        let selected = self.hovered == Some(slot);
+        let session_id = self.invocation.session_id;
+        let activate = self.commands.clone();
+        Some(
+            div()
+                .id(("ring-caption", slot.index()))
+                .absolute()
+                .left(px(left + SLOT_SIZE / 2.0 - CAPTION_WIDTH / 2.0))
+                .top(px(top + SLOT_SIZE + 2.0))
+                .w(px(CAPTION_WIDTH))
+                .flex()
+                .justify_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .max_w(px(CAPTION_WIDTH))
+                        .px(px(6.0))
+                        .rounded_full()
+                        .bg(CAPTION_PILL)
+                        .text_xs()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(if selected { LABEL } else { CAPTION_RESTING })
+                        .child(display_label(presentation)),
+                )
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    if *hovered && this.hovered != Some(slot) {
+                        this.hovered = Some(slot);
+                        let _ = this
+                            .commands
+                            .send(OverlayCommand::Hover { session_id, slot });
+                        cx.notify();
+                    } else if !*hovered && this.hovered == Some(slot) {
+                        this.hovered = None;
+                        cx.notify();
+                    }
+                }))
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    let _ = activate.send(OverlayCommand::Activate { session_id, slot });
+                    window.remove_window();
+                })
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for RingView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let session_id = self.invocation.session_id;
@@ -177,25 +240,7 @@ impl Render for RingView {
         // they had not configured in a while would do.
         let captions = ActionRingSlot::ALL
             .into_iter()
-            .filter_map(|slot| {
-                let presentation = self.invocation.slots.get(&slot)?;
-                let (left, top) = slot.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
-                let selected = self.hovered == Some(slot);
-                Some(
-                    div()
-                        .absolute()
-                        .left(px(left + SLOT_SIZE / 2.0 - CAPTION_WIDTH / 2.0))
-                        .top(px(top + SLOT_SIZE + 3.0))
-                        .w(px(CAPTION_WIDTH))
-                        .text_center()
-                        .text_xs()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(if selected { LABEL } else { CAPTION_RESTING })
-                        .child(display_label(presentation)),
-                )
-            })
+            .filter_map(|slot| self.caption_element(slot, cx))
             .collect::<Vec<_>>();
         let slots = ActionRingSlot::ALL
             .into_iter()
@@ -250,6 +295,11 @@ impl Render for RingView {
                         .w(px(120.0))
                         .text_center()
                         .text_sm()
+                        // One line only: a long (translated or custom) label
+                        // must not wrap down onto the Bottom slot.
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .text_color(LABEL)
                         .child(label),
                 )
