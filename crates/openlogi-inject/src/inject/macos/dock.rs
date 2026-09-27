@@ -20,8 +20,19 @@ pub(super) fn show_desktop() {
     send("com.apple.showdesktop.awake");
 }
 
-/// Toggle Launchpad. A no-op on macOS 26, which removed Launchpad.
+/// Where macOS 26 put Launchpad's replacement: the Apps launcher.
+const APPS_LAUNCHER: &str = "/System/Applications/Apps.app";
+
+/// Open the app launcher: Launchpad through the Dock, or on macOS 26+ —
+/// which removed Launchpad and left the Dock notification a silent no-op —
+/// the Apps launcher that replaced it.
 pub(super) fn launchpad() {
+    if std::path::Path::new(APPS_LAUNCHER).exists() {
+        if let Err(error) = opener::open(APPS_LAUNCHER) {
+            tracing::warn!(%error, "could not open the Apps launcher");
+        }
+        return;
+    }
     send("com.apple.launchpad.toggle");
 }
 
