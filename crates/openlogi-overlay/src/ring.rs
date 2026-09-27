@@ -22,29 +22,47 @@ use crate::ipc::OverlayCommand;
 use crate::session::{ClickAwaySession, ShowingRing};
 
 pub(crate) const WINDOW_SIZE: f32 = 360.0;
-pub(crate) const SLOT_SIZE: f32 = 46.0;
-pub(crate) const RADIUS: f32 = 118.0;
-/// Width of the always-visible caption under each slot. Wide enough for two
-/// short words at `text_xs`, narrow enough that neighbouring captions on the
-/// 118 px radius (≈90 px apart) never touch. Slots shrank from 54 px to 46 px
-/// to make room inside the unchanged 360 px window.
-const CAPTION_WIDTH: f32 = 84.0;
-const CAPTION_RESTING: Hsla = neutral(0.78, 1.0);
-/// Each caption sits on its own pill in the panel's colour, so a caption that
-/// reaches past the round panel (the lower slots sit near its rim) still reads
-/// over whatever is on the desktop behind the transparent window.
-const CAPTION_PILL: Hsla = neutral(0.08, 0.92);
+/// Distance from the ring's centre to the centre of each action chip.
+pub(crate) const RADIUS: f32 = 112.0;
+/// Each action is one horizontal chip carrying its icon *and* its name, so a
+/// label can never drift away from, or crowd into, a neighbour. At this size
+/// on the 112 px radius the closest pair (diagonal neighbours) keeps a 4.8 px
+/// gap, the farthest corner sits 168.6 px out (inside the 174 px panel), and
+/// the cancel button keeps a 54 px clearing.
+const CHIP_WIDTH: f32 = 112.0;
+const CHIP_HEIGHT: f32 = 28.0;
+/// Inset of the round panel from the window edge (panel radius 174 px).
+pub(crate) const PANEL_INSET: f32 = 6.0;
+const CANCEL_SIZE: f32 = 44.0;
 
-/// The ring's own neutral scale. It floats over whatever is on the desktop, so
-/// unlike the settings app it cannot take its surfaces from the OS appearance —
-/// it commits to a dark panel and rides its own contrast. Only the accent is
-/// shared (`openlogi_ui::color`); these greys are local by nature.
-const PANEL: Hsla = neutral(0.06, 0.82);
-const SLOT_RESTING: Hsla = neutral(0.16, 0.98);
-const CANCEL_RESTING: Hsla = neutral(0.20, 0.98);
+/// The ring's own palette. It floats over whatever is on the desktop, so unlike
+/// the settings app it cannot take its surfaces from the OS appearance. On
+/// macOS the panel is frosted glass — the window's behind-window blur, masked
+/// to the panel circle in `platform::configure_windows` — so its tint and the
+/// chips stay translucent; elsewhere there is no blur and they go near-opaque.
+/// Only the accent is shared (`openlogi_ui::color`).
+#[cfg(target_os = "macos")]
+mod palette {
+    use super::{Hsla, neutral};
+    pub(super) const PANEL: Hsla = neutral(0.06, 0.34);
+    pub(super) const CHIP: Hsla = neutral(1.0, 0.10);
+    pub(super) const CANCEL: Hsla = neutral(1.0, 0.12);
+}
+#[cfg(not(target_os = "macos"))]
+mod palette {
+    use super::{Hsla, neutral};
+    pub(super) const PANEL: Hsla = neutral(0.06, 0.86);
+    pub(super) const CHIP: Hsla = neutral(0.18, 0.98);
+    pub(super) const CANCEL: Hsla = neutral(0.22, 0.98);
+}
+use palette::{CANCEL, CHIP, PANEL};
+/// A hairline of light on every glass edge, the cue that separates layers when
+/// there is no opaque fill to do it.
+const GLASS_EDGE: Hsla = neutral(1.0, 0.16);
 const GLYPH: Hsla = neutral(0.98, 1.0);
-const LABEL: Hsla = neutral(0.94, 1.0);
-const CANCEL_GLYPH: Hsla = neutral(0.82, 1.0);
+const LABEL: Hsla = neutral(0.97, 1.0);
+const LABEL_RESTING: Hsla = neutral(0.90, 1.0);
+const CANCEL_GLYPH: Hsla = neutral(0.86, 1.0);
 
 const fn neutral(lightness: f32, alpha: f32) -> Hsla {
     Hsla {
@@ -56,8 +74,8 @@ const fn neutral(lightness: f32, alpha: f32) -> Hsla {
 }
 
 /// The accent deepened for the dark panel: the brand lightness sits too close to
-/// the white glyph a selected slot carries, so the fill drops to `0.48` and the
-/// ring around it rises to `0.78`. Both keep the brand hue and saturation.
+/// the white glyph a selected chip carries, so the fill drops to `0.48` and the
+/// edge around it rises to `0.78`. Both keep the brand hue and saturation.
 const SELECTED_FILL_L: f32 = 0.48;
 const SELECTED_BORDER_L: f32 = 0.78;
 
@@ -75,51 +93,17 @@ fn display_label(presentation: &openlogi_ipc::ActionRingPresentation) -> SharedS
     SharedString::from(label)
 }
 
-/// The two hit areas that make up one slot.
-#[derive(Clone, Copy)]
-enum SlotPart {
-    Circle,
-    Caption,
-}
-
-#[derive(Default)]
-struct HoverParts {
-    circle: Option<ActionRingSlot>,
-    caption: Option<ActionRingSlot>,
-}
-
-impl HoverParts {
-    /// Record one part's hover edge; returns the slot that should now read as
-    /// hovered.
-    fn update(
-        &mut self,
-        slot: ActionRingSlot,
-        part: SlotPart,
-        hovered: bool,
-    ) -> Option<ActionRingSlot> {
-        let field = match part {
-            SlotPart::Circle => &mut self.circle,
-            SlotPart::Caption => &mut self.caption,
-        };
-        if hovered {
-            *field = Some(slot);
-        } else if *field == Some(slot) {
-            *field = None;
-        }
-        // The caption is on top, so it wins while both claim a slot.
-        self.caption.or(self.circle)
-    }
+/// Top-left corner of `slot`'s chip inside the window.
+fn chip_origin(slot: ActionRingSlot) -> (f32, f32) {
+    // A zero-size placement is the chip's centre.
+    let (cx, cy) = slot.placement(WINDOW_SIZE, RADIUS, 0.0);
+    (cx - CHIP_WIDTH / 2.0, cy - CHIP_HEIGHT / 2.0)
 }
 
 pub(crate) struct RingView {
     invocation: ActionRingInvocation,
     commands: mpsc::UnboundedSender<OverlayCommand>,
     hovered: Option<ActionRingSlot>,
-    /// Which slot's circle and which slot's caption the pointer is over. A
-    /// slot stays highlighted while either part is hovered; tracking them
-    /// separately means the order gpui delivers the two parts' hover events in
-    /// (caption first — it is drawn on top) can never clear a live highlight.
-    hover_parts: HoverParts,
     /// Publishes click-away identity for exactly this view's lifetime.
     _showing: ShowingRing,
 }
@@ -136,7 +120,6 @@ impl RingView {
             invocation,
             commands,
             hovered: None,
-            hover_parts: HoverParts::default(),
             _showing: showing,
         }
     }
@@ -154,7 +137,9 @@ impl RingView {
         });
     }
 
-    fn slot_element(
+    /// One action chip: icon and name on a single glass pill, which is the
+    /// whole hit target for hover (haptic buzz) and activation.
+    fn chip_element(
         &self,
         slot: ActionRingSlot,
         cx: &mut Context<Self>,
@@ -162,7 +147,7 @@ impl RingView {
         let presentation = self.invocation.slots.get(&slot)?;
         let icon_path = presentation.icon.asset_path();
         let selected = self.hovered == Some(slot);
-        let (left, top) = slot.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
+        let (left, top) = chip_origin(slot);
         let session_id = self.invocation.session_id;
         let activate = self.commands.clone();
         Some(
@@ -171,100 +156,52 @@ impl RingView {
                 .absolute()
                 .left(px(left))
                 .top(px(top))
-                .size(px(SLOT_SIZE))
+                .w(px(CHIP_WIDTH))
+                .h(px(CHIP_HEIGHT))
                 .flex()
                 .items_center()
-                .justify_center()
+                .gap(px(5.0))
+                .px(px(9.0))
                 .rounded_full()
-                .bg(if selected {
-                    color::accent_at_lightness(SELECTED_FILL_L)
-                } else {
-                    SLOT_RESTING
+                .border_1()
+                .map(|chip| {
+                    if selected {
+                        chip.bg(color::accent_at_lightness(SELECTED_FILL_L))
+                            .border_color(color::accent_at_lightness(SELECTED_BORDER_L))
+                    } else {
+                        chip.bg(CHIP).border_color(GLASS_EDGE)
+                    }
                 })
-                .when(selected, |slot| {
-                    slot.border_2()
-                        .border_color(color::accent_at_lightness(SELECTED_BORDER_L))
-                })
-                .shadow_md()
-                .text_color(GLYPH)
-                .cursor_pointer()
-                .child(svg().path(icon_path).size(px(20.0)).text_color(GLYPH))
-                .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    this.on_part_hover(slot, SlotPart::Circle, *hovered, cx);
-                }))
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    let _ = activate.send(OverlayCommand::Activate { session_id, slot });
-                    window.remove_window();
-                })
-                .into_any_element(),
-        )
-    }
-}
-
-impl RingView {
-    /// Fold one part's hover edge into the slot highlight, reporting a newly
-    /// hovered slot to the agent (which drives the haptic buzz).
-    fn on_part_hover(
-        &mut self,
-        slot: ActionRingSlot,
-        part: SlotPart,
-        hovered: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let next = self.hover_parts.update(slot, part, hovered);
-        if next == self.hovered {
-            return;
-        }
-        self.hovered = next;
-        if let Some(slot) = next {
-            let _ = self.commands.send(OverlayCommand::Hover {
-                session_id: self.invocation.session_id,
-                slot,
-            });
-        }
-        cx.notify();
-    }
-
-    /// A slot's caption: centred under the slot on a dark pill, truncated to
-    /// [`CAPTION_WIDTH`], and wired to the same hover and activation as the
-    /// slot itself.
-    fn caption_element(
-        &self,
-        slot: ActionRingSlot,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let presentation = self.invocation.slots.get(&slot)?;
-        let (left, top) = slot.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
-        let selected = self.hovered == Some(slot);
-        let session_id = self.invocation.session_id;
-        let activate = self.commands.clone();
-        Some(
-            div()
-                .id(("ring-caption", slot.index()))
-                .absolute()
-                .left(px(left + SLOT_SIZE / 2.0 - CAPTION_WIDTH / 2.0))
-                .top(px(top + SLOT_SIZE))
-                .pt(px(2.0))
-                .w(px(CAPTION_WIDTH))
-                .flex()
-                .justify_center()
                 .cursor_pointer()
                 .child(
+                    svg()
+                        .path(icon_path)
+                        .size(px(14.0))
+                        .flex_none()
+                        .text_color(GLYPH),
+                )
+                .child(
                     div()
-                        .max_w(px(CAPTION_WIDTH))
-                        .px(px(6.0))
-                        .rounded_full()
-                        .bg(CAPTION_PILL)
-                        .text_xs()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(11.0))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .text_color(if selected { LABEL } else { CAPTION_RESTING })
+                        .text_color(if selected { LABEL } else { LABEL_RESTING })
                         .child(display_label(presentation)),
                 )
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
-                    this.on_part_hover(slot, SlotPart::Caption, *hovered, cx);
+                    if *hovered && this.hovered != Some(slot) {
+                        this.hovered = Some(slot);
+                        let _ = this
+                            .commands
+                            .send(OverlayCommand::Hover { session_id, slot });
+                        cx.notify();
+                    } else if !*hovered && this.hovered == Some(slot) {
+                        this.hovered = None;
+                        cx.notify();
+                    }
                 }))
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -281,18 +218,9 @@ impl Render for RingView {
         let session_id = self.invocation.session_id;
         let root_commands = self.commands.clone();
         let center_commands = self.commands.clone();
-        let hovered_label = self
-            .hovered
-            .and_then(|slot| self.invocation.slots.get(&slot).map(display_label));
-        // Every slot names itself: icons alone left users guessing what a ring
-        // they had not configured in a while would do.
-        let captions = ActionRingSlot::ALL
+        let chips = ActionRingSlot::ALL
             .into_iter()
-            .filter_map(|slot| self.caption_element(slot, cx))
-            .collect::<Vec<_>>();
-        let slots = ActionRingSlot::ALL
-            .into_iter()
-            .filter_map(|slot| self.slot_element(slot, cx))
+            .filter_map(|slot| self.chip_element(slot, cx))
             .collect::<Vec<_>>();
 
         div()
@@ -302,56 +230,38 @@ impl Render for RingView {
             .child(
                 div()
                     .absolute()
-                    .left(px(18.0))
-                    .top(px(18.0))
-                    .size(px(WINDOW_SIZE - 36.0))
+                    .left(px(PANEL_INSET))
+                    .top(px(PANEL_INSET))
+                    .size(px(WINDOW_SIZE - 2.0 * PANEL_INSET))
                     .rounded_full()
                     .bg(PANEL)
-                    .shadow_lg(),
+                    .border_1()
+                    .border_color(GLASS_EDGE),
             )
-            .children(slots)
-            .children(captions)
+            .children(chips)
             .child(
                 div()
                     .id("ring-cancel")
                     .absolute()
-                    .left(px(WINDOW_SIZE / 2.0 - 24.0))
-                    .top(px(WINDOW_SIZE / 2.0 - 24.0))
-                    .size(px(48.0))
+                    .left(px(WINDOW_SIZE / 2.0 - CANCEL_SIZE / 2.0))
+                    .top(px(WINDOW_SIZE / 2.0 - CANCEL_SIZE / 2.0))
+                    .size(px(CANCEL_SIZE))
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .bg(CANCEL_RESTING)
+                    .bg(CANCEL)
+                    .border_1()
+                    .border_color(GLASS_EDGE)
                     .text_color(CANCEL_GLYPH)
                     .cursor_pointer()
-                    .child(svg().path(RING_CANCEL_ICON).size(px(20.0)).flex_none())
+                    .child(svg().path(RING_CANCEL_ICON).size(px(18.0)).flex_none())
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         let _ = center_commands.send(OverlayCommand::Cancel { session_id });
                         window.remove_window();
                     }),
             )
-            .when_some(hovered_label, |ring, label| {
-                ring.child(
-                    div()
-                        .absolute()
-                        // Narrow enough to clear the Left/Right slot captions
-                        // that sit at the same height.
-                        .left(px(WINDOW_SIZE / 2.0 - 60.0))
-                        .top(px(WINDOW_SIZE / 2.0 + 30.0))
-                        .w(px(120.0))
-                        .text_center()
-                        .text_sm()
-                        // One line only: a long (translated or custom) label
-                        // must not wrap down onto the Bottom slot.
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(LABEL)
-                        .child(label),
-                )
-            })
             .on_click(move |_, window, _| {
                 let _ = root_commands.send(OverlayCommand::Cancel { session_id });
                 window.remove_window();
@@ -369,7 +279,13 @@ pub(crate) fn ring_window_options() -> WindowOptions {
         is_movable: false,
         is_resizable: false,
         is_minimizable: false,
-        window_background: WindowBackgroundAppearance::Transparent,
+        // macOS frosts what is behind the ring; the blur view gpui installs is
+        // masked to the panel circle in `platform::configure_windows`.
+        window_background: if cfg!(target_os = "macos") {
+            WindowBackgroundAppearance::Blurred
+        } else {
+            WindowBackgroundAppearance::Transparent
+        },
         app_id: Some("openlogi-action-ring".to_string()),
         ..WindowOptions::default()
     }
@@ -418,35 +334,37 @@ mod tests {
 }
 
 #[cfg(test)]
-mod hover_part_tests {
+mod chip_layout_tests {
     use super::*;
 
-    #[test]
-    fn a_fast_move_from_circle_to_caption_keeps_the_slot_highlighted() {
-        // gpui delivers the caption's edge first (it is drawn on top).
-        let mut parts = HoverParts::default();
-        let slot = ActionRingSlot::Bottom;
-        assert_eq!(parts.update(slot, SlotPart::Circle, true), Some(slot));
-        assert_eq!(parts.update(slot, SlotPart::Caption, true), Some(slot));
-        assert_eq!(parts.update(slot, SlotPart::Circle, false), Some(slot));
-        assert_eq!(parts.update(slot, SlotPart::Caption, false), None);
+    fn rect(slot: ActionRingSlot) -> (f32, f32, f32, f32) {
+        let (left, top) = chip_origin(slot);
+        (left, top, left + CHIP_WIDTH, top + CHIP_HEIGHT)
     }
 
     #[test]
-    fn moving_to_another_slot_hands_the_highlight_over() {
-        let mut parts = HoverParts::default();
-        assert_eq!(
-            parts.update(ActionRingSlot::Top, SlotPart::Circle, true),
-            Some(ActionRingSlot::Top)
-        );
-        assert_eq!(
-            parts.update(ActionRingSlot::TopRight, SlotPart::Circle, true),
-            Some(ActionRingSlot::TopRight)
-        );
-        // A late unhover for the old slot must not clear the new one.
-        assert_eq!(
-            parts.update(ActionRingSlot::Top, SlotPart::Circle, false),
-            Some(ActionRingSlot::TopRight)
-        );
+    fn chips_never_touch_each_other_the_cancel_button_or_the_panel_rim() {
+        let centre = WINDOW_SIZE / 2.0;
+        let panel_radius = centre - PANEL_INSET;
+        let slots = ActionRingSlot::ALL;
+        for (i, &a) in slots.iter().enumerate() {
+            let (l, t, r, b) = rect(a);
+            for &(x, y) in &[(l, t), (r, t), (l, b), (r, b)] {
+                let reach = ((x - centre).powi(2) + (y - centre).powi(2)).sqrt();
+                assert!(reach <= panel_radius - 2.0, "{a:?} corner leaves the panel");
+            }
+            let nearest_x = centre.clamp(l, r);
+            let nearest_y = centre.clamp(t, b);
+            let clearance = ((nearest_x - centre).powi(2) + (nearest_y - centre).powi(2)).sqrt();
+            assert!(
+                clearance >= CANCEL_SIZE / 2.0 + 8.0,
+                "{a:?} crowds the cancel button"
+            );
+            for &other in &slots[i + 1..] {
+                let (l2, t2, r2, b2) = rect(other);
+                let gap = (l2 - r).max(l - r2).max(t2 - b).max(t - b2);
+                assert!(gap >= 4.0, "{a:?} and {other:?} are only {gap} px apart");
+            }
+        }
     }
 }

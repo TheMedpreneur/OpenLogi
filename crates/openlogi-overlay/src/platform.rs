@@ -33,8 +33,59 @@ pub fn configure_windows() {
         for window in NSApplication::sharedApplication(marker).windows() {
             window.setStyleMask(NSWindowStyleMask::NonactivatingPanel);
             window.setHasShadow(false);
+            shape_glass(&window);
         }
     }
+}
+
+/// Turn gpui's window-sized behind-window blur into a frosted disc under the
+/// ring panel: dark HUD material, always active, masked to the panel circle so
+/// the square window's corners stay clear.
+#[cfg(target_os = "macos")]
+fn shape_glass(window: &objc2_app_kit::NSWindow) {
+    use objc2_app_kit::{
+        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    };
+
+    let Some(content) = window.contentView() else {
+        return;
+    };
+    for view in content.subviews() {
+        let Ok(glass) = view.downcast::<NSVisualEffectView>() else {
+            continue;
+        };
+        glass.setMaterial(NSVisualEffectMaterial::HUDWindow);
+        glass.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+        glass.setState(NSVisualEffectState::Active);
+        let mask = circle_mask(glass.bounds().size, f64::from(crate::ring::PANEL_INSET));
+        glass.setMaskImage(Some(&mask));
+    }
+}
+
+/// An image the size of the blur view whose only opaque pixels are the panel
+/// circle (`inset` from every edge).
+#[cfg(target_os = "macos")]
+fn circle_mask(
+    size: objc2_foundation::NSSize,
+    inset: f64,
+) -> objc2::rc::Retained<objc2_app_kit::NSImage> {
+    use objc2::runtime::Bool;
+    use objc2_app_kit::{NSBezierPath, NSColor, NSImage};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let draw = block2::RcBlock::new(move |bounds: NSRect| -> Bool {
+        let oval = NSRect::new(
+            NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
+            NSSize::new(
+                bounds.size.width - 2.0 * inset,
+                bounds.size.height - 2.0 * inset,
+            ),
+        );
+        NSColor::blackColor().setFill();
+        NSBezierPath::bezierPathWithOvalInRect(oval).fill();
+        Bool::YES
+    });
+    NSImage::imageWithSize_flipped_drawingHandler(size, false, &draw)
 }
 
 /// No native application policy is required away from macOS.
