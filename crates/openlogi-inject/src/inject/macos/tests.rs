@@ -63,3 +63,25 @@ fn held_edges_carry_the_aggregate_modifier_state() {
     assert!(!flags.contains(CGEventFlags::CGEventFlagCommand));
     assert!(flags.contains(CGEventFlags::CGEventFlagControl));
 }
+
+#[test]
+fn arrow_keys_keep_their_own_numeric_pad_and_fn_bits() {
+    use core_graphics::event::CGEventFlags as F;
+    // What CGEventCreateKeyboardEvent returns for kVK_UpArrow on macOS 27,
+    // with Shift held on the real keyboard at the time.
+    let natural = F::from_bits_retain(0x20a0_0000) | F::CGEventFlagShift;
+    let merged = super::merge_key_flags(natural, F::CGEventFlagCommand);
+    assert!(merged.contains(F::CGEventFlagCommand));
+    assert!(merged.contains(F::CGEventFlagNumericPad));
+    assert!(merged.contains(F::CGEventFlagSecondaryFn));
+    assert!(
+        !merged.contains(F::CGEventFlagShift),
+        "a modifier held on the keyboard must not leak into the chord"
+    );
+    // A letter key carries neither bit, so its chord goes out unchanged.
+    let letter = F::from_bits_retain(0x2000_0000);
+    assert_eq!(
+        super::merge_key_flags(letter, F::CGEventFlagCommand),
+        F::CGEventFlagCommand
+    );
+}

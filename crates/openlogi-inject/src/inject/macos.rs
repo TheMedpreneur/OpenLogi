@@ -265,8 +265,20 @@ fn post_key_phase(vk: u16, flags: CGEventFlags, phase: KeyPhase) {
         tracing::warn!(?phase, "CGEvent::new_keyboard_event failed");
         return;
     };
-    event.set_flags(flags);
+    event.set_flags(merge_key_flags(event.get_flags(), flags));
     event.post(CGEventTapLocation::HID);
+}
+
+/// The flags a synthesized key edge goes out with: the chord's modifiers, plus
+/// the numeric-pad and Fn bits macOS itself stamps on arrow and navigation
+/// keys. Replacing the flags outright drops those bits, and apps that read
+/// them (text views, some list views) then misread Up/Down or Cmd+Up. Held
+/// modifiers from the live HID state are still discarded — only the key's own
+/// bits survive.
+fn merge_key_flags(natural: CGEventFlags, chord: CGEventFlags) -> CGEventFlags {
+    let key_own =
+        natural & (CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn);
+    chord | key_own
 }
 
 /// Post a key-down + key-up pair for `vk` with `flags` set.
