@@ -191,11 +191,11 @@ pub fn plan_for_device(
     // briefly reverts to firmware behaviour. The action itself still follows
     // the front app: dispatch-only changes hot-swap without touching the
     // device, and a default binding is emulated as native horizontal scroll.
-    let thumbwheel_bindings_nondefault = thumbwheel_nondefault(&bindings)
-        || config
-            .app_profiles(config_key)
-            .filter(|profile| Some(*profile) != app)
-            .any(|profile| {
+    // Base bindings plus every profile, and deliberately NOT the front app's
+    // effective map: the answer must be identical whichever app is in front.
+    let thumbwheel_bindings_nondefault =
+        thumbwheel_nondefault(&button_bindings_for(config, Some(config_key), None))
+            || config.app_profiles(config_key).any(|profile| {
                 thumbwheel_nondefault(&button_bindings_for(
                     config,
                     Some(config_key),
@@ -443,9 +443,39 @@ mod tests {
             "other apps keep their own wheel action"
         );
 
+        assert_eq!(
+            plans[2]
+                .dispatch
+                .bindings
+                .get(&ButtonId::ThumbwheelScrollUp),
+            Some(&Binding::Single(Action::HorizontalScrollLeft)),
+            "an app without a profile scrolls horizontally, as the firmware would"
+        );
+
         // With no wheel binding anywhere the wheel stays fully native.
         let native = plan_for_device(&Config::default(), "2b042", route(), None, 0, true);
         assert!(!native.target.spec.capture_thumbwheel);
+
+        // A non-default BASE binding that one profile resets to the default
+        // must not make the profile's app the odd one out either.
+        let mut cfg = Config::default();
+        cfg.set_binding(
+            "2b042",
+            ButtonId::ThumbwheelScrollUp,
+            Binding::Single(Action::VolumeUp),
+        );
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.google.Chrome",
+            ButtonId::ThumbwheelScrollUp,
+            Some(Action::HorizontalScrollLeft),
+        );
+        let targets: Vec<_> = [None, Some("com.google.Chrome"), Some("com.apple.Notes")]
+            .into_iter()
+            .map(|app| plan_for_device(&cfg, "2b042", route(), app, 0, true).target)
+            .collect();
+        assert!(targets.iter().all(|t| t.spec.capture_thumbwheel));
+        assert!(targets.iter().all(|t| *t == targets[0]));
     }
 
     #[test]
