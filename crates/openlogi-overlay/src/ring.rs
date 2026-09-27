@@ -22,8 +22,14 @@ use crate::ipc::OverlayCommand;
 use crate::session::{ClickAwaySession, ShowingRing};
 
 pub(crate) const WINDOW_SIZE: f32 = 360.0;
-pub(crate) const SLOT_SIZE: f32 = 54.0;
-pub(crate) const RADIUS: f32 = 122.0;
+pub(crate) const SLOT_SIZE: f32 = 46.0;
+pub(crate) const RADIUS: f32 = 118.0;
+/// Width of the always-visible caption under each slot. Wide enough for two
+/// short words at `text_xs`, narrow enough that neighbouring captions on the
+/// 118 px radius (≈90 px apart) never touch. Slots shrank from 54 px to 46 px
+/// to make room inside the unchanged 360 px window.
+const CAPTION_WIDTH: f32 = 84.0;
+const CAPTION_RESTING: Hsla = neutral(0.78, 1.0);
 
 /// The ring's own neutral scale. It floats over whatever is on the desktop, so
 /// unlike the settings app it cannot take its surfaces from the OS appearance —
@@ -50,6 +56,20 @@ const fn neutral(lightness: f32, alpha: f32) -> Hsla {
 /// ring around it rises to `0.78`. Both keep the brand hue and saturation.
 const SELECTED_FILL_L: f32 = 0.48;
 const SELECTED_BORDER_L: f32 = 0.78;
+
+/// The text shown for a slot. User-authored labels render verbatim: passing
+/// them through the localization table would translate any label that happens
+/// to collide with a known key ("Copy" → "Copier" under fr).
+fn display_label(presentation: &openlogi_ipc::ActionRingPresentation) -> SharedString {
+    let label = if presentation.literal {
+        presentation.label.clone()
+    } else if let Some(key) = Action::translation_key_for_label(&presentation.label) {
+        rust_i18n::t!(key).into_owned()
+    } else {
+        presentation.label.clone()
+    };
+    SharedString::from(label)
+}
 
 pub(crate) struct RingView {
     invocation: ActionRingInvocation,
@@ -122,7 +142,7 @@ impl RingView {
                 .shadow_md()
                 .text_color(GLYPH)
                 .cursor_pointer()
-                .child(svg().path(icon_path).size(px(22.0)).text_color(GLYPH))
+                .child(svg().path(icon_path).size(px(20.0)).text_color(GLYPH))
                 .on_hover(cx.listener(move |this, hovered, _, cx| {
                     if *hovered && this.hovered != Some(slot) {
                         this.hovered = Some(slot);
@@ -150,20 +170,33 @@ impl Render for RingView {
         let session_id = self.invocation.session_id;
         let root_commands = self.commands.clone();
         let center_commands = self.commands.clone();
-        let hovered_label = self.hovered.and_then(|slot| {
-            let presentation = self.invocation.slots.get(&slot)?;
-            // User-authored labels render verbatim: passing them through the
-            // localization table would translate any label that happens to
-            // collide with a known key ("Copy" → "Copier" under fr).
-            let label = if presentation.literal {
-                presentation.label.clone()
-            } else if let Some(key) = Action::translation_key_for_label(&presentation.label) {
-                rust_i18n::t!(key).into_owned()
-            } else {
-                presentation.label.clone()
-            };
-            Some(SharedString::from(label))
-        });
+        let hovered_label = self
+            .hovered
+            .and_then(|slot| self.invocation.slots.get(&slot).map(display_label));
+        // Every slot names itself: icons alone left users guessing what a ring
+        // they had not configured in a while would do.
+        let captions = ActionRingSlot::ALL
+            .into_iter()
+            .filter_map(|slot| {
+                let presentation = self.invocation.slots.get(&slot)?;
+                let (left, top) = slot.placement(WINDOW_SIZE, RADIUS, SLOT_SIZE);
+                let selected = self.hovered == Some(slot);
+                Some(
+                    div()
+                        .absolute()
+                        .left(px(left + SLOT_SIZE / 2.0 - CAPTION_WIDTH / 2.0))
+                        .top(px(top + SLOT_SIZE + 3.0))
+                        .w(px(CAPTION_WIDTH))
+                        .text_center()
+                        .text_xs()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(if selected { LABEL } else { CAPTION_RESTING })
+                        .child(display_label(presentation)),
+                )
+            })
+            .collect::<Vec<_>>();
         let slots = ActionRingSlot::ALL
             .into_iter()
             .filter_map(|slot| self.slot_element(slot, cx))
@@ -184,6 +217,7 @@ impl Render for RingView {
                     .shadow_lg(),
             )
             .children(slots)
+            .children(captions)
             .child(
                 div()
                     .id("ring-cancel")
@@ -209,9 +243,11 @@ impl Render for RingView {
                 ring.child(
                     div()
                         .absolute()
-                        .left(px(WINDOW_SIZE / 2.0 - 80.0))
-                        .top(px(WINDOW_SIZE / 2.0 + 34.0))
-                        .w(px(160.0))
+                        // Narrow enough to clear the Left/Right slot captions
+                        // that sit at the same height.
+                        .left(px(WINDOW_SIZE / 2.0 - 60.0))
+                        .top(px(WINDOW_SIZE / 2.0 + 30.0))
+                        .w(px(120.0))
                         .text_center()
                         .text_sm()
                         .text_color(LABEL)
