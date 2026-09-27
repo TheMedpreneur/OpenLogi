@@ -172,7 +172,20 @@ pub fn plan_for_device(
     // its raw-XY divert everywhere, and in an app whose profile single-binds
     // it, dispatch (which does follow the front app) fires the single action
     // on press and ignores the gesture stream.
-    let spec_gesture_bindings = hidpp_gesture_maps_for(config, Some(config_key), None);
+    //
+    // One deliberate exception: a front app that binds a source to `None`
+    // means "leave it native" (firmware feel, no frozen cursor while held), so
+    // that app still releases the source — accepting a re-arm for that case.
+    let front_app_releases = |button: &ButtonId| {
+        GESTURE_SOURCE_BUTTONS
+            .iter()
+            .any(|(_, source)| source == button)
+            && bindings
+                .get(button)
+                .is_some_and(|binding| binding == &Binding::Single(Action::None))
+    };
+    let mut spec_gesture_bindings = hidpp_gesture_maps_for(config, Some(config_key), None);
+    spec_gesture_bindings.retain(|button, _| !front_app_releases(button));
     let all_profiles = all_profile_bindings(config, config_key);
     let mut divert_gesture_buttons = Vec::new();
     if os_mouse_hook_available {
@@ -211,9 +224,10 @@ pub fn plan_for_device(
             // `spec_gesture_bindings`); OS-hook buttons keep following the
             // front app, where native vs injected behaviour differs.
             if GESTURE_SOURCE_BUTTONS.iter().any(|(_, source)| source == button) {
-                all_profiles
-                    .iter()
-                    .any(|profile| wants_plain_divert(profile, *button))
+                !front_app_releases(button)
+                    && all_profiles
+                        .iter()
+                        .any(|profile| wants_plain_divert(profile, *button))
             } else {
                 wants_plain_divert(&bindings, *button)
             }
@@ -621,6 +635,44 @@ mod tests {
     }
 
     #[test]
+    fn a_per_app_none_on_a_gesturing_panel_still_releases_it_in_that_app() {
+        // `None` means "leave the panel native" — honoured per app even though
+        // it costs a re-arm on switching to that app.
+        let mut cfg = Config::default();
+        cfg.set_gesture_mode("2b042", ButtonId::HapticPanel, true);
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.example.Game",
+            ButtonId::HapticPanel,
+            Some(Action::None),
+        );
+        let in_game = plan_for_device(&cfg, "2b042", route(), Some("com.example.Game"), 0, true);
+        assert!(
+            !in_game
+                .target
+                .spec
+                .divert_gesture_sources
+                .contains(&HAPTIC_PANEL_CID)
+        );
+        assert!(
+            !in_game
+                .target
+                .spec
+                .divert_buttons
+                .iter()
+                .any(|&(cid, _)| cid == HAPTIC_PANEL_CID)
+        );
+        let elsewhere = plan_for_device(&cfg, "2b042", route(), Some("com.apple.Notes"), 0, true);
+        assert!(
+            elsewhere
+                .target
+                .spec
+                .divert_gesture_sources
+                .contains(&HAPTIC_PANEL_CID)
+        );
+    }
+
+    #[test]
     fn haptic_panel_gestures_when_promoted() {
         // The MX Master 4 haptic panel is a HID++ gesture source: promoting it
         // into gesture mode must arm the raw-XY gesture divert, exactly like
@@ -868,6 +920,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.set_gesture_mode("2b042", ButtonId::DpiToggle, true);
         for action in [Action::Paste, Action::None] {
+            let base_target = plan_for_device(&cfg, "2b042", route(), None, 0, false).target;
             cfg.set_per_app_binding(
                 "2b042",
                 "com.example.Editor",
@@ -885,6 +938,10 @@ mod tests {
                 );
                 // The device keeps its raw-XY divert in every app; only
                 // dispatch changes, so switching apps never re-arms.
+                assert_eq!(
+                    plan.target, base_target,
+                    "DPI capture must not follow the app"
+                );
                 assert!(
                     plan.target
                         .spec
