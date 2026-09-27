@@ -801,13 +801,26 @@ impl Orchestrator {
         if layout.slots.is_empty() {
             return None;
         }
-        let haptic_route = (device.online
-            && ring.haptics
-            && device
-                .capabilities
-                .is_some_and(|capabilities| capabilities.haptic_feedback))
-        .then(|| device.route.clone())
-        .flatten();
+        let haptic_capable = device
+            .capabilities
+            .as_ref()
+            .map(|capabilities| capabilities.haptic_feedback);
+        let haptic_route = (device.online && ring.haptics && haptic_capable == Some(true))
+            .then(|| device.route.clone())
+            .flatten();
+        // A ring without haptics is otherwise completely silent in the log:
+        // no play is attempted, so nothing can fail. Say why, loudly, so a
+        // "the ring works but never buzzes" report is diagnosable from one
+        // log line instead of a reproduction session.
+        if haptic_route.is_none() && ring.haptics && haptic_capable != Some(false) {
+            warn!(
+                device = %key,
+                online = device.online,
+                has_route = device.route.is_some(),
+                haptic_capable = ?haptic_capable,
+                "Actions Ring opened without haptics"
+            );
+        }
         Some(ActionRingSessionSpec {
             device_key: key.to_owned(),
             haptic_route,
