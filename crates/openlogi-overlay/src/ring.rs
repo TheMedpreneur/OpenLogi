@@ -27,8 +27,8 @@ pub(crate) const RADIUS: f32 = 165.0;
 /// Each action is one glass tile: a colour-coded icon badge over a label of up
 /// to two lines, so names read at a normal size instead of being squeezed onto
 /// one tiny line. On the 165 px radius the closest tiles keep a 16.7 px gap,
-/// the farthest corner sits 218 px out (inside the 232 px panel), and the
-/// cancel button keeps a 115 px clearing.
+/// the farthest corner (a diagonal tile's) sits 226.7 px out, inside the
+/// 232 px panel, and the diagonal tiles keep 103.9 px from the centre.
 const CHIP_WIDTH: f32 = 100.0;
 const CHIP_HEIGHT: f32 = 74.0;
 const BADGE_SIZE: f32 = 32.0;
@@ -38,8 +38,8 @@ pub(crate) const PANEL_INSET: f32 = 8.0;
 const CANCEL_SIZE: f32 = 48.0;
 
 /// A hue per kind of action, so the ring can be read at a glance by colour
-/// before the labels are read: editing, windows and spaces, browser tabs,
-/// media, capture and system, pointer. Anything else stays neutral.
+/// before the labels are read: editing, files and windows, navigation, media,
+/// marking, capture and system, pointer. Only `Ban` stays neutral.
 fn badge_hue(icon: ActionRingIcon) -> Option<f32> {
     use ActionRingIcon as I;
     Some(match icon {
@@ -57,7 +57,10 @@ fn badge_hue(icon: ActionRingIcon) -> Option<f32> {
         | I::Monitor
         | I::Applications
         | I::PreviousDesktop
-        | I::NextDesktop => 0.47,
+        | I::NextDesktop
+        | I::Folder
+        | I::File
+        | I::Book => 0.47,
         I::NewTab
         | I::CloseTab
         | I::ReopenTab
@@ -65,11 +68,19 @@ fn badge_hue(icon: ActionRingIcon) -> Option<f32> {
         | I::PreviousTab
         | I::Reload
         | I::MouseBack
-        | I::MouseForward => 0.72,
+        | I::MouseForward
+        | I::ArrowUp
+        | I::ArrowDown
+        | I::ArrowLeft
+        | I::ArrowRight
+        | I::ScrollLeft
+        | I::ScrollRight
+        | I::Globe => 0.72,
         I::Play | I::Volume | I::VolumeDown | I::Mute | I::PreviousTrack | I::NextTrack => 0.07,
-        I::Camera | I::Lock | I::Refresh => 0.93,
+        I::Star | I::Heart | I::Bell | I::Calendar | I::User => 0.13,
+        I::Camera | I::Lock | I::Refresh | I::Terminal | I::Settings | I::Palette => 0.93,
         I::Pointer | I::Mouse | I::Gauge => 0.36,
-        _ => return None,
+        I::Ban => return None,
     })
 }
 
@@ -202,7 +213,7 @@ impl RingView {
         });
     }
 
-    /// One action chip: icon and name on a single glass pill, which is the
+    /// One action tile: colour badge over a two-line label, which is the
     /// whole hit target for hover (haptic buzz) and activation.
     fn chip_element(
         &self,
@@ -255,7 +266,7 @@ impl RingView {
                         .rounded_full()
                         .bg(badge_fill(presentation.icon))
                         .border_1()
-                        .border_color(GLASS_EDGE)
+                        .border_color(if selected { GLYPH } else { GLASS_EDGE })
                         .child(svg().path(icon_path).size(px(17.0)).text_color(GLYPH)),
                 )
                 .child(
@@ -266,6 +277,7 @@ impl RingView {
                         .line_height(px(LABEL_SIZE + 2.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .line_clamp(2)
+                        .text_ellipsis()
                         .text_color(if selected { LABEL } else { LABEL_RESTING })
                         .child(display_label(presentation)),
                 )
@@ -323,15 +335,14 @@ impl Render for RingView {
             .child(
                 div()
                     .absolute()
-                    .left(px(PANEL_INSET + 24.0))
-                    .top(px(PANEL_INSET + 4.0))
-                    .w(px(WINDOW_SIZE - 2.0 * PANEL_INSET - 48.0))
-                    .h(px(WINDOW_SIZE / 2.0 - PANEL_INSET))
-                    .rounded_t_full()
+                    .left(px(PANEL_INSET + 1.0))
+                    .top(px(PANEL_INSET + 1.0))
+                    .size(px(WINDOW_SIZE - 2.0 * PANEL_INSET - 2.0))
+                    .rounded_full()
                     .bg(linear_gradient(
                         180.0,
                         linear_color_stop(SHEEN, 0.0),
-                        linear_color_stop(neutral(1.0, 0.0), 1.0),
+                        linear_color_stop(neutral(1.0, 0.0), 0.5),
                     )),
             )
             .children(chips)
