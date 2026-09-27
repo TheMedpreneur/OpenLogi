@@ -37,7 +37,7 @@ embed-resource = "3.0.9"
 # (its bounds are display-relative). C FFI, so core-graphics.
 core-graphics = { workspace = true }
 objc2 = { workspace = true }
-objc2-app-kit = { workspace = true, features = ["NSApplication", "NSResponder", "NSWindow", "NSEvent", "block2", "NSView", "NSVisualEffectView", "NSImage", "NSBezierPath", "NSColor", "NSGraphics"] }
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSResponder", "NSWindow", "NSEvent", "block2", "NSView", "NSVisualEffectView", "NSImage", "NSBezierPath", "NSColor", "NSGraphics", "NSWorkspace", "NSAccessibility"] }
 # Frosted-glass panel: NSSize/NSRect for the blur view's circular mask.
 objc2-foundation = { workspace = true, features = ["NSGeometry", "NSArray"] }
 # NSEvent global-monitor handlers are ObjC blocks (click-away dismissal).

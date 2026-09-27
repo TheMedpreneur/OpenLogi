@@ -38,14 +38,27 @@ pub fn configure_windows() {
     }
 }
 
+/// Whether the ring can be drawn as glass: macOS blurs behind the window unless
+/// the user turned on "Reduce transparency", which leaves no blur to read over.
+#[cfg(target_os = "macos")]
+pub fn glass_enabled() -> bool {
+    !objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency()
+}
+
+/// No behind-window blur away from macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn glass_enabled() -> bool {
+    false
+}
+
 /// Turn gpui's window-sized behind-window blur into a frosted disc under the
-/// ring panel: dark HUD material, always active, masked to the panel circle so
-/// the square window's corners stay clear.
+/// ring panel by masking it to the panel circle, so the square window's
+/// corners stay clear. The blur's own material tint is not set here: gpui's
+/// blur view strips every sublayer fill on update, so the ring's gpui-drawn
+/// gradient provides all of the tint.
 #[cfg(target_os = "macos")]
 fn shape_glass(window: &objc2_app_kit::NSWindow) {
-    use objc2_app_kit::{
-        NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    };
+    use objc2_app_kit::NSVisualEffectView;
 
     let Some(content) = window.contentView() else {
         return;
@@ -54,9 +67,6 @@ fn shape_glass(window: &objc2_app_kit::NSWindow) {
         let Ok(glass) = view.downcast::<NSVisualEffectView>() else {
             continue;
         };
-        glass.setMaterial(NSVisualEffectMaterial::HUDWindow);
-        glass.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-        glass.setState(NSVisualEffectState::Active);
         let mask = circle_mask(glass.bounds().size, f64::from(crate::ring::PANEL_INSET));
         glass.setMaskImage(Some(&mask));
     }

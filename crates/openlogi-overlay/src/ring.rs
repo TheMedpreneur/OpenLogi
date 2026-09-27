@@ -9,7 +9,7 @@ use gpui::{Bounds, Pixels, Point, Size, point};
 use gpui::{
     Context, Hsla, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Window, WindowBackgroundAppearance, WindowKind,
-    WindowOptions, div, prelude::FluentBuilder as _, px, svg,
+    WindowOptions, div, linear_color_stop, linear_gradient, prelude::FluentBuilder as _, px, svg,
 };
 use openlogi_core::binding::{Action, ActionRingSlot};
 use openlogi_ipc::ActionRingInvocation;
@@ -34,28 +34,39 @@ const CHIP_HEIGHT: f32 = 28.0;
 /// Inset of the round panel from the window edge (panel radius 174 px).
 pub(crate) const PANEL_INSET: f32 = 6.0;
 const CANCEL_SIZE: f32 = 44.0;
+/// The hovered action's full name, under the cancel button.
+const HOVER_LABEL_WIDTH: f32 = 180.0;
 
 /// The ring's own palette. It floats over whatever is on the desktop, so unlike
-/// the settings app it cannot take its surfaces from the OS appearance. On
-/// macOS the panel is frosted glass — the window's behind-window blur, masked
-/// to the panel circle in `platform::configure_windows` — so its tint and the
-/// chips stay translucent; elsewhere there is no blur and they go near-opaque.
-/// Only the accent is shared (`openlogi_ui::color`).
-#[cfg(target_os = "macos")]
-mod palette {
-    use super::{Hsla, neutral};
-    pub(super) const PANEL: Hsla = neutral(0.06, 0.34);
-    pub(super) const CHIP: Hsla = neutral(1.0, 0.10);
-    pub(super) const CANCEL: Hsla = neutral(1.0, 0.12);
+/// the settings app it cannot take its surfaces from the OS appearance. Only
+/// the accent is shared (`openlogi_ui::color`); these greys are local by nature.
+struct Palette {
+    /// Panel gradient, top to bottom.
+    panel: (Hsla, Hsla),
+    /// Resting chip gradient, top to bottom: a lit upper edge fading down is
+    /// what reads as glass rather than a flat translucent fill.
+    chip: (Hsla, Hsla),
+    cancel: Hsla,
 }
-#[cfg(not(target_os = "macos"))]
-mod palette {
-    use super::{Hsla, neutral};
-    pub(super) const PANEL: Hsla = neutral(0.06, 0.86);
-    pub(super) const CHIP: Hsla = neutral(0.18, 0.98);
-    pub(super) const CANCEL: Hsla = neutral(0.22, 0.98);
-}
-use palette::{CANCEL, CHIP, PANEL};
+
+/// Frosted glass over macOS's behind-window blur. gpui strips the blur view's
+/// own material tint (its `updateLayer` clears every sublayer fill), so all of
+/// the darkness has to come from these fills: the panel stays dark enough that
+/// white 11 px labels keep roughly 5:1 contrast even over a white page.
+const GLASS: Palette = Palette {
+    panel: (neutral(0.18, 0.72), neutral(0.04, 0.86)),
+    chip: (neutral(1.0, 0.17), neutral(1.0, 0.05)),
+    cancel: neutral(1.0, 0.12),
+};
+
+/// No blur behind the window (other platforms, or macOS "Reduce
+/// transparency"): the same shapes on near-opaque fills.
+const SOLID: Palette = Palette {
+    panel: (neutral(0.10, 0.98), neutral(0.06, 0.98)),
+    chip: (neutral(0.24, 1.0), neutral(0.18, 1.0)),
+    cancel: neutral(0.24, 1.0),
+};
+
 /// A hairline of light on every glass edge, the cue that separates layers when
 /// there is no opaque fill to do it.
 const GLASS_EDGE: Hsla = neutral(1.0, 0.16);
@@ -102,6 +113,8 @@ fn chip_origin(slot: ActionRingSlot) -> (f32, f32) {
 
 pub(crate) struct RingView {
     invocation: ActionRingInvocation,
+    /// Chosen once per ring: glass when the OS will blur behind the window.
+    palette: &'static Palette,
     commands: mpsc::UnboundedSender<OverlayCommand>,
     hovered: Option<ActionRingSlot>,
     /// Publishes click-away identity for exactly this view's lifetime.
@@ -118,6 +131,11 @@ impl RingView {
         let showing = live.showing(invocation.session_id);
         Self {
             invocation,
+            palette: if crate::platform::glass_enabled() {
+                &GLASS
+            } else {
+                &SOLID
+            },
             commands,
             hovered: None,
             _showing: showing,
@@ -169,7 +187,12 @@ impl RingView {
                         chip.bg(color::accent_at_lightness(SELECTED_FILL_L))
                             .border_color(color::accent_at_lightness(SELECTED_BORDER_L))
                     } else {
-                        chip.bg(CHIP).border_color(GLASS_EDGE)
+                        chip.bg(linear_gradient(
+                            180.0,
+                            linear_color_stop(self.palette.chip.0, 0.0),
+                            linear_color_stop(self.palette.chip.1, 1.0),
+                        ))
+                        .border_color(GLASS_EDGE)
                     }
                 })
                 .cursor_pointer()
@@ -218,6 +241,9 @@ impl Render for RingView {
         let session_id = self.invocation.session_id;
         let root_commands = self.commands.clone();
         let center_commands = self.commands.clone();
+        let hovered_label = self
+            .hovered
+            .and_then(|slot| self.invocation.slots.get(&slot).map(display_label));
         let chips = ActionRingSlot::ALL
             .into_iter()
             .filter_map(|slot| self.chip_element(slot, cx))
@@ -234,7 +260,11 @@ impl Render for RingView {
                     .top(px(PANEL_INSET))
                     .size(px(WINDOW_SIZE - 2.0 * PANEL_INSET))
                     .rounded_full()
-                    .bg(PANEL)
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(self.palette.panel.0, 0.0),
+                        linear_color_stop(self.palette.panel.1, 1.0),
+                    ))
                     .border_1()
                     .border_color(GLASS_EDGE),
             )
@@ -250,7 +280,7 @@ impl Render for RingView {
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .bg(CANCEL)
+                    .bg(self.palette.cancel)
                     .border_1()
                     .border_color(GLASS_EDGE)
                     .text_color(CANCEL_GLYPH)
@@ -262,6 +292,24 @@ impl Render for RingView {
                         window.remove_window();
                     }),
             )
+            .when_some(hovered_label, |ring, label| {
+                ring.child(
+                    div()
+                        .absolute()
+                        // Between the cancel button and the Bottom chip, clear
+                        // of the Left/Right and lower diagonal chips.
+                        .left(px(WINDOW_SIZE / 2.0 - HOVER_LABEL_WIDTH / 2.0))
+                        .top(px(WINDOW_SIZE / 2.0 + CANCEL_SIZE / 2.0 + 6.0))
+                        .w(px(HOVER_LABEL_WIDTH))
+                        .text_center()
+                        .text_xs()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(LABEL)
+                        .child(label),
+                )
+            })
             .on_click(move |_, window, _| {
                 let _ = root_commands.send(OverlayCommand::Cancel { session_id });
                 window.remove_window();
@@ -360,6 +408,17 @@ mod chip_layout_tests {
                 clearance >= CANCEL_SIZE / 2.0 + 8.0,
                 "{a:?} crowds the cancel button"
             );
+            let label_top = centre + CANCEL_SIZE / 2.0 + 6.0;
+            let (label_l, label_r, label_b) = (
+                centre - HOVER_LABEL_WIDTH / 2.0,
+                centre + HOVER_LABEL_WIDTH / 2.0,
+                label_top + 20.0,
+            );
+            let label_gap = (l - label_r)
+                .max(label_l - r)
+                .max(t - label_b)
+                .max(label_top - b);
+            assert!(label_gap >= 2.0, "{a:?} overlaps the hover label");
             for &other in &slots[i + 1..] {
                 let (l2, t2, r2, b2) = rect(other);
                 let gap = (l2 - r).max(l - r2).max(t2 - b).max(t - b2);
