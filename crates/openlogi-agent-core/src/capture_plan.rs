@@ -98,6 +98,21 @@ pub(crate) fn hidpp_side_gesture_maps_for(
         .collect()
 }
 
+/// Whether `bindings` gives the thumb wheel anything but its firmware default.
+fn thumbwheel_nondefault(bindings: &BTreeMap<ButtonId, Binding>) -> bool {
+    [
+        ButtonId::Thumbwheel,
+        ButtonId::ThumbwheelScrollUp,
+        ButtonId::ThumbwheelScrollDown,
+    ]
+    .iter()
+    .any(|button| {
+        bindings
+            .get(button)
+            .is_some_and(|binding| binding.click_action() != default_binding(*button))
+    })
+}
+
 /// Build one device's plan from the config (per-app effective for `app`).
 #[must_use]
 pub fn plan_for_device(
@@ -168,17 +183,25 @@ pub fn plan_for_device(
             })
         })
         .collect();
-    let thumbwheel_bindings_nondefault = [
-        ButtonId::Thumbwheel,
-        ButtonId::ThumbwheelScrollUp,
-        ButtonId::ThumbwheelScrollDown,
-    ]
-    .iter()
-    .any(|button| {
-        bindings
-            .get(button)
-            .is_some_and(|binding| binding.click_action() != default_binding(*button))
-    });
+    // Thumb-wheel diversion is decided across EVERY app profile, not just the
+    // app in front. Otherwise one per-app wheel binding (say, tab switching in
+    // a browser) flips the capture target on each app switch, and every flip
+    // tears the whole control session down and re-diverts it over HID++ —
+    // hundreds of Bluetooth round trips a day, each a window where the mouse
+    // briefly reverts to firmware behaviour. The action itself still follows
+    // the front app: dispatch-only changes hot-swap without touching the
+    // device, and a default binding is emulated as native horizontal scroll.
+    let thumbwheel_bindings_nondefault = thumbwheel_nondefault(&bindings)
+        || config
+            .app_profiles(config_key)
+            .filter(|profile| Some(*profile) != app)
+            .any(|profile| {
+                thumbwheel_nondefault(&button_bindings_for(
+                    config,
+                    Some(config_key),
+                    Some(profile),
+                ))
+            });
     let thumbwheel_sensitivity = config.thumbwheel_sensitivity(config_key);
     DeviceCapturePlan {
         target: CaptureTarget {
@@ -377,6 +400,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_per_app_thumbwheel_binding_keeps_one_capture_target_across_apps() {
+        // Shane's config: Chrome maps the thumb wheel to tab switching, every
+        // other app keeps horizontal scroll. Switching apps must only change
+        // dispatch, never the capture target, or each switch re-diverts the
+        // whole device over HID++.
+        let mut cfg = Config::default();
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.google.Chrome",
+            ButtonId::ThumbwheelScrollUp,
+            Some(Action::NextTab),
+        );
+        let plans: Vec<_> = [None, Some("com.google.Chrome"), Some("com.apple.Notes")]
+            .into_iter()
+            .map(|app| plan_for_device(&cfg, "2b042", route(), app, 0, true))
+            .collect();
+        for plan in &plans {
+            assert!(plan.target.spec.capture_thumbwheel);
+            assert_eq!(
+                plan.target, plans[0].target,
+                "capture target must not follow the app"
+            );
+        }
+        assert_eq!(
+            plans[1]
+                .dispatch
+                .bindings
+                .get(&ButtonId::ThumbwheelScrollUp),
+            Some(&Binding::Single(Action::NextTab)),
+            "the front app still picks the action"
+        );
+        assert_ne!(
+            plans[2]
+                .dispatch
+                .bindings
+                .get(&ButtonId::ThumbwheelScrollUp),
+            Some(&Binding::Single(Action::NextTab)),
+            "other apps keep their own wheel action"
+        );
+
+        // With no wheel binding anywhere the wheel stays fully native.
+        let native = plan_for_device(&Config::default(), "2b042", route(), None, 0, true);
+        assert!(!native.target.spec.capture_thumbwheel);
     }
 
     #[test]
